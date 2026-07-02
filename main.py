@@ -84,12 +84,12 @@ def buscar_odds_do_dia():
 
 
 @bot.command()
-async def jogoshoje(ctx):
+async def jogos(ctx):
     odds, status_ou_erro = buscar_odds_do_dia()
 
     if odds is None:
         await ctx.send("❌ **Ih, deu ruim!** Não consegui puxar os jogos. O dono do bot deve ter esquecido de pagar a conta da API.")
-        print(f"[ERRO NO !jogoshoje] {status_ou_erro}", flush=True)
+        print(f"[ERRO NO !jogos] {status_ou_erro}", flush=True)
         return
 
     if not odds:
@@ -134,7 +134,7 @@ async def apostar(ctx, jogo: str, palpite: str, valor: float):
         return
 
     if jogo not in odds:
-        await ctx.send("❌ Jogo não encontrado. Use `!jogoshoje` para ver as opções disponíveis.")
+        await ctx.send("❌ Jogo não encontrado. Use `!jogos` para ver as opções disponíveis.")
         return
 
     horario_jogo = odds[jogo]["Horario_DT"]
@@ -373,7 +373,7 @@ async def comandos(ctx):
 
     embed.add_field(name="!ping", value="Verifica se o bot está online.", inline=False)
     embed.add_field(name="!registrar", value="Cria uma conta e recebe 1000 Pilas para apostar.", inline=False)
-    embed.add_field(name="!jogoshoje", value="Mostra os jogos de hoje com suas odds.", inline=False)
+    embed.add_field(name="!jogos", value="Mostra os jogos com suas odds.", inline=False)
     embed.add_field(name="!apostar <jogo> <palpite> <valor>", value="Faz uma aposta em um jogo específico.", inline=False)
     embed.add_field(name="!campeao <selecao>", value="Diz quem você acha que será o campeão da Copa.", inline=False)
     embed.add_field(name="!artilheiro <jogador>", value="Diz quem você acha que será o artilheiro da Copa.", inline=False)
