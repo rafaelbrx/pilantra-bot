@@ -184,7 +184,7 @@ async def apostar(ctx):
     await ctx.send("👇 **Abra o menu abaixo e selecione a partida:**", view=view)
 
 @bot.command()
-async def jogoshoje(ctx):
+async def jogos(ctx):
     odds, status = buscar_odds_do_dia()
     if not odds:
         await ctx.send("⚽ **Sem jogos hoje!**")
