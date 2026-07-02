@@ -3,9 +3,11 @@ from discord.ext import commands
 import os
 import sqlite3
 import requests
-from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 from keep_alive import keep_alive
+
+from dotenv import load_dotenv
+load_dotenv()
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -14,11 +16,8 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 def init_db():
     conn = sqlite3.connect('bolao.db')
     c = conn.cursor()
-    # Tabela de carteira da galera
     c.execute('''CREATE TABLE IF NOT EXISTS usuarios (id_discord TEXT PRIMARY KEY, saldo REAL)''')
-    # Tabela do campeão da copa
     c.execute('''CREATE TABLE IF NOT EXISTS palpites_campeao (id_discord TEXT PRIMARY KEY, selecao TEXT)''')
-    # Tabela das apostas dos jogos do dia
     c.execute('''CREATE TABLE IF NOT EXISTS apostas (id_discord TEXT, jogo TEXT, palpite TEXT, valor REAL, odd REAL)''')
     conn.commit()
     conn.close()
@@ -26,11 +25,62 @@ def init_db():
 init_db()
 
 def buscar_odds_do_dia():
-    odds = {
-        "BRAxARG": {"Vencedor_Casa": "BRA", "Odd_Casa": 2.50, "Vencedor_Fora": "ARG", "Odd_Fora": 3.10, "Horario": "16:00"},
-        "FRAxENG": {"Vencedor_Casa": "FRA", "Odd_Casa": 3.80, "Vencedor_Fora": "ENG", "Odd_Fora": 1.90, "Horario": "20:00"} 
-    }
-    return odds
+    API_KEY = os.environ.get('ODDS_API_KEY')
+    
+    if not API_KEY:
+        print("Erro: Chave da API de Odds não encontrada nas variáveis de ambiente!")
+        return None
+
+    url = f"https://api.the-odds-api.com/v4/sports/soccer_fifa_world_cup/odds/?apiKey={API_KEY}&regions=eu&markets=h2h"
+    
+    try:
+        resposta = requests.get(url)
+        
+        if resposta.status_code != 200:
+            print(f"Erro na API: {resposta.status_code}")
+            return None
+            
+        dados = resposta.json()
+        odds_do_dia = {}
+        
+        for jogo in dados:
+            horario_bruto = jogo.get("commence_time")
+            horario_obj = datetime.strptime(horario_bruto, "%Y-%m-%dT%H:%M:%SZ")
+            horario_brasil = horario_obj - timedelta(hours=3)
+            horario_formatado = horario_brasil.strftime("%d/%m às %H:%M")
+            
+            time_casa = jogo.get("home_team")
+            time_fora = jogo.get("away_team")
+            
+            if jogo.get("bookmakers"):
+                mercados = jogo["bookmakers"][0].get("markets", [])
+                if mercados and mercados[0].get("outcomes"):
+                    resultados = mercados[0]["outcomes"]
+                    
+                    odd_casa = 0
+                    odd_fora = 0
+                    
+                    for resultado in resultados:
+                        if resultado["name"] == time_casa:
+                            odd_casa = resultado["price"]
+                        elif resultado["name"] == time_fora:
+                            odd_fora = resultado["price"]
+                    
+                    chave_jogo = f"{time_casa}x{time_fora}"
+                    
+                    odds_do_dia[chave_jogo] = {
+                        "Vencedor_Casa": time_casa,
+                        "Odd_Casa": odd_casa,
+                        "Vencedor_Fora": time_fora,
+                        "Odd_Fora": odd_fora,
+                        "Horario": horario_formatado
+                    }
+                    
+        return odds_do_dia
+
+    except Exception as e:
+        print(f"Erro ao processar dados da API: {e}")
+        return None
 
 @bot.command()
 async def jogoshoje(ctx):
