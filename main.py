@@ -104,7 +104,7 @@ async def registrar(ctx):
     else:
         c.execute("INSERT INTO usuarios (id_discord, saldo) VALUES (?, ?)", (id_usuario, 1000.0))
         await ctx.send(f"🎉 Bem-vindo ao vício, {ctx.author.mention}! Você recebeu **1000 Pilas** para começar. LET'S GO GAMBLING")
-        await ctx.send("https://tenor.com/pt-BR/view/dodep2-gif-10081337658340044214")
+        await ctx.send("https://media.tenor.com/i-gbL-IgbbYAAAAj/dodep2.gif")
 
     conn.commit()
     conn.close()
@@ -202,14 +202,14 @@ async def resultado(ctx, jogo: str, vencedor: str):
             
             if odd >= 3.50:
                 await ctx.send(f"🦓 **VAI TOMANDO!** A PLATAFORMA TA BUGADA! <@{id_discord}> faturou absurdos {lucro} Pilas!")
-                await ctx.send("https://tenor.com/pt-BR/view/money-make-it-rain-rain-guap-dollar-gif-2486578895352396283")
+                await ctx.send("https://media1.tenor.com/m/IoIaVLN2efsAAAAd/money-make-it-rain.gif")
             else:
                 await ctx.send(f"✅ <@{id_discord}> ganhou a aposta e recebeu {lucro} Pilas!")
                 
         else:
             if saldo_atual < 10:
                 await ctx.send(f"📉 **DEU RED!** O loss veio pesado pra <@{id_discord}>, hora de vender o celta.")
-                await ctx.send("https://tenor.com/pt-BR/view/laughing-cat-catlaughing-laughingcat-point-gif-7577620470218150413")
+                await ctx.send("https://media1.tenor.com/m/aSkdq3IU0g0AAAAd/laughing-cat.gif")
 
     c.execute("DELETE FROM apostas WHERE jogo = ?", (jogo,))
     conn.commit()
