@@ -89,7 +89,7 @@ async def jogoshoje(ctx):
 
     if odds is None:
         await ctx.send("❌ **Ih, deu ruim!** Não consegui puxar os jogos. O dono do bot deve ter esquecido de pagar a conta da API.")
-        print(f"[ERRO NO !jogoshoje] {status_ou_erro}")
+        print(f"[ERRO NO !jogoshoje] {status_ou_erro}", flush=True)
         return
 
     if not odds:
@@ -130,7 +130,7 @@ async def apostar(ctx, jogo: str, palpite: str, valor: float):
 
     if odds is None:
         await ctx.send("❌ **Ih, deu ruim!** O sistema de apostas está fora do ar momentaneamente.")
-        print(f"[ERRO NO !apostar] {status_ou_erro}")
+        print(f"[ERRO NO !apostar] {status_ou_erro}", flush=True)
         return
 
     if jogo not in odds:
@@ -362,6 +362,40 @@ async def palpites(ctx):
         embed.add_field(name="📅 Jogos do Dia", value="Você não apostou em nenhum jogo hoje. Use `!apostar`", inline=False)
 
     await ctx.send(embed=embed)
+
+@bot.command()
+async def help(ctx):
+    embed = discord.Embed(
+        title="📜 Comandos do Pilantra Bot",
+        description="Aqui estão os comandos disponíveis:",
+        color=discord.Color.blue()
+    )
+
+    embed.add_field(name="!ping", value="Verifica se o bot está online.", inline=False)
+    embed.add_field(name="!registrar", value="Cria uma conta e recebe 1000 Pilas para apostar.", inline=False)
+    embed.add_field(name="!jogoshoje", value="Mostra os jogos de hoje com suas odds.", inline=False)
+    embed.add_field(name="!apostar <jogo> <palpite> <valor>", value="Faz uma aposta em um jogo específico.", inline=False)
+    embed.add_field(name="!campeao <selecao>", value="Diz quem você acha que será o campeão da Copa.", inline=False)
+    embed.add_field(name="!artilheiro <jogador>", value="Diz quem você acha que será o artilheiro da Copa.", inline=False)
+    embed.add_field(name="!saldo", value="Mostra seu saldo atual de Pilas.", inline=False)
+    embed.add_field(name="!palpites", value="Mostra todos os seus palpites e apostas atuais.", inline=False)
+
+    await ctx.send(embed=embed)
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"⚠️ **Faltou informação aí, {ctx.author.name}!**\nJeito certo de usar: `{ctx.prefix}{ctx.command.name} {ctx.command.signature}`")
+    
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send("⚠️ **Você digitou algo errado!** Verifique se não colocou letras onde deveriam ser números.")
+    
+    elif isinstance(error, commands.CommandNotFound):
+        await ctx.send(f"❌ **Comando não encontrado, {ctx.author.name}!** Use `!help` para ver a lista de comandos disponíveis.")
+        pass 
+    
+    else:
+        print(f"Erro interno não tratado: {error}")
 
 @bot.event
 async def on_ready():
