@@ -364,7 +364,7 @@ async def palpites(ctx):
     await ctx.send(embed=embed)
 
 @bot.command()
-async def help(ctx):
+async def comandos(ctx):
     embed = discord.Embed(
         title="📜 Comandos do Pilantra Bot",
         description="Aqui estão os comandos disponíveis:",
@@ -391,7 +391,7 @@ async def on_command_error(ctx, error):
         await ctx.send("⚠️ **Você digitou algo errado!** Verifique se não colocou letras onde deveriam ser números.")
     
     elif isinstance(error, commands.CommandNotFound):
-        await ctx.send(f"❌ **Comando não encontrado, {ctx.author.name}!** Use `!help` para ver a lista de comandos disponíveis.")
+        await ctx.send(f"❌ **Comando não encontrado, {ctx.author.name}!** Use `!comandos` para ver a lista de comandos disponíveis.")
         pass 
     
     else:
