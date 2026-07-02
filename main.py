@@ -293,6 +293,21 @@ async def processar_resultado(ctx, jogo: str, vencedor: str):
     conn.close()
 
 @bot.command()
+async def ping(ctx):
+    await ctx.send(f"🏓 Pong! Latência: {round(bot.latency * 1000)}ms")
+
+@bot.command()
+async def comandos(ctx):
+    embed = discord.Embed(title="📜 Comandos do Pilantra BOT", color=discord.Color.blue())
+    embed.add_field(name="!registrar", value="Cria sua conta e recebe 1000 Pilas para começar.", inline=False)
+    embed.add_field(name="!saldo", value="Mostra seu saldo atual de Pilas.", inline=False)
+    embed.add_field(name="!jogos", value="Lista os jogos do dia com odds.", inline=False)
+    embed.add_field(name="!apostar", value="Abre o menu interativo para apostar nos jogos do dia.", inline=False)
+    embed.add_field(name="!palpites", value="Mostra seus palpites e apostas registradas.", inline=False)
+    embed.add_field(name="Administração", value="!resultado, !simular, !addsaldo, !remsaldo, !remaposta", inline=False)
+    await ctx.send(embed=embed)
+
+@bot.command()
 @commands.has_role("Pilantra BOT")
 async def resultado(ctx, jogo: str, vencedor: str):
     await ctx.send(f"⚽ **FIM DE PAPO!** O **{vencedor}** venceu a partida **{jogo}**! Calculando pagamentos...")
