@@ -259,7 +259,6 @@ async def palpites(ctx):
     await ctx.send(embed=embed)
 
 async def processar_resultado(ctx, jogo: str, vencedor: str):
-    """Função utilitária para pagar as apostas (usada pelo resultado e simular)"""
     conn = sqlite3.connect('bolao.db')
     c = conn.cursor()
     c.execute("SELECT id_discord, palpite, valor, odd FROM apostas WHERE jogo = ?", (jogo,))
@@ -297,6 +296,97 @@ async def ping(ctx):
     await ctx.send(f"🏓 Pong! Latência: {round(bot.latency * 1000)}ms")
 
 @bot.command()
+async def pix(ctx, membro: discord.Member, valor: int):
+    if valor <= 0:
+        await ctx.send("❌ Você não pode transferir valores negativos ou zero!")
+        return
+        
+    if membro.id == ctx.author.id:
+        await ctx.send("❌ Você não pode fazer um PIX para si mesmo, gênio!")
+        return
+
+    conn = sqlite3.connect('bolao.db')
+    c = conn.cursor()
+    
+    # Checa o saldo de quem está enviando
+    c.execute("SELECT saldo FROM usuarios WHERE id_discord = ?", (str(ctx.author.id),))
+    remetente = c.fetchone()
+    
+    # Checa se quem está recebendo tem conta
+    c.execute("SELECT saldo FROM usuarios WHERE id_discord = ?", (str(membro.id),))
+    destinatario = c.fetchone()
+
+    if not remetente:
+        await ctx.send("❌ Você não tem conta. Use `!registrar`.")
+    elif not destinatario:
+        await ctx.send(f"❌ {membro.mention} ainda não tem conta no bot.")
+    elif int(remetente[0]) < valor:
+        await ctx.send(f"💸 PIX Recusado! Você tentou enviar {valor}, mas só tem {remetente[0]} Pilas.")
+    else:
+        novo_saldo_remetente = int(remetente[0]) - valor
+        novo_saldo_destinatario = int(destinatario[0]) + valor
+        
+        c.execute("UPDATE usuarios SET saldo = ? WHERE id_discord = ?", (novo_saldo_remetente, str(ctx.author.id)))
+        c.execute("UPDATE usuarios SET saldo = ? WHERE id_discord = ?", (novo_saldo_destinatario, str(membro.id)))
+        
+        await ctx.send(f"💸 **PIX REALIZADO!** {ctx.author.mention} transferiu **{valor} Pilas** para {membro.mention}!")
+        
+    conn.commit()
+    conn.close()
+
+@bot.command()
+@commands.cooldown(1, 86400, commands.BucketType.user)
+async def mendigar(ctx):
+    conn = sqlite3.connect('bolao.db')
+    c = conn.cursor()
+    id_usuario = str(ctx.author.id)
+
+    c.execute("SELECT saldo FROM usuarios WHERE id_discord = ?", (id_usuario,))
+    resultado = c.fetchone()
+
+    if not resultado:
+        await ctx.send("❌ Você não tem conta! Use `!registrar` primeiro.")
+        ctx.command.reset_cooldown(ctx)
+        conn.close()
+        return
+
+    saldo_atual = int(resultado[0])
+
+    if saldo_atual >= 100:
+        await ctx.send(f"🛑 Sai pra lá, caloteiro! Você ainda tem {saldo_atual} Pilas. Vá apostar!")
+        ctx.command.reset_cooldown(ctx)
+        conn.close()
+        return
+
+    esmolinha = 100
+    novo_saldo = saldo_atual + esmolinha
+    
+    c.execute("UPDATE usuarios SET saldo = ? WHERE id_discord = ?", (novo_saldo, id_usuario))
+    conn.commit()
+    conn.close()
+
+    await ctx.send(f"🥺 Você estava na miséria, então o sistema teve pena. Você recebeu **{esmolinha} Pilas** de esmola!\nSaldo atual: {novo_saldo} Pilas.")
+
+@bot.command()
+async def ranking(ctx):
+    conn = sqlite3.connect('bolao.db')
+    c = conn.cursor()
+    c.execute("SELECT id_discord, saldo FROM usuarios ORDER BY saldo DESC LIMIT 10")
+    top_usuarios = c.fetchall()
+    conn.close()
+
+    if not top_usuarios:
+        await ctx.send("📊 Nenhum usuário registrado ainda.")
+        return
+
+    embed = discord.Embed(title="🏆 Ranking dos Pilantras", color=discord.Color.gold())
+    for i, (id_discord, saldo) in enumerate(top_usuarios, start=1):
+        usuario = await bot.fetch_user(int(id_discord))
+        embed.add_field(name=f"{i}º - {usuario.name}", value=f"💰 {saldo} Pilas", inline=False)
+
+    await ctx.send(embed=embed)
+
+@bot.command()
 async def comandos(ctx):
     embed = discord.Embed(title="📜 Comandos do Pilantra BOT", color=discord.Color.blue())
     embed.add_field(name="!registrar", value="Cria sua conta e recebe 1000 Pilas para começar.", inline=False)
@@ -304,7 +394,10 @@ async def comandos(ctx):
     embed.add_field(name="!jogos", value="Lista os jogos do dia com odds.", inline=False)
     embed.add_field(name="!apostar", value="Abre o menu interativo para apostar nos jogos do dia.", inline=False)
     embed.add_field(name="!palpites", value="Mostra seus palpites e apostas registradas.", inline=False)
-    embed.add_field(name="Administração", value="!resultado, !simular, !addsaldo, !remsaldo, !remaposta", inline=False)
+    embed.add_field(name="!pix", value="Transfere Pilas para outro usuário.", inline=False)
+    embed.add_field(name="!mendigar", value="Solicita 100 Pilas de graça (só pode uma vez a cada 24h).", inline=False)
+    embed.add_field(name="!ranking", value="Mostra o ranking dos usuários com mais Pilas.", inline=False)
+    embed.add_field(name="Administração", value="!resultado, !simular, !addsaldo, !remsaldo, !remaposta, !apostasDoDia", inline=False)
     await ctx.send(embed=embed)
 
 @bot.command()
@@ -380,10 +473,35 @@ async def remaposta(ctx, membro: discord.Member, *, jogo: str):
     conn.commit()
     conn.close()
 
+@bot.command()
+@commands.has_role("Pilantra BOT")
+async def apostasDoDia(ctx):
+    conn = sqlite3.connect('bolao.db')
+    c = conn.cursor()
+    c.execute("SELECT jogo, palpite, valor, odd FROM apostas")
+    apostas = c.fetchall()
+    conn.close()
+
+    if not apostas:
+        await ctx.send("📅 Nenhuma aposta registrada hoje.")
+        return
+
+    embed = discord.Embed(title="📅 Apostas do Dia", color=discord.Color.purple())
+    for aposta in apostas:
+        jogo, palpite, valor, odd = aposta
+        embed.add_field(name=jogo, value=f"Palpite: **{palpite}** | 💸 {int(valor)} Pilas (Odd: {odd})", inline=False)
+    
+    await ctx.send(embed=embed)
+
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingRole):
         await ctx.send("⛔ Só o mais pilantra pode usar este comando!")
+    
+    elif isinstance(error, commands.CommandOnCooldown):
+        horas = int(error.retry_after // 3600)
+        minutos = int((error.retry_after % 3600) // 60)
+        await ctx.send(f"⏳ Calma aí, mendigo! Você já pediu sua esmola de hoje. Volte daqui a **{horas}h e {minutos}m**.")
 
 @bot.event
 async def on_ready():
