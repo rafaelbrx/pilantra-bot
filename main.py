@@ -18,6 +18,7 @@ def init_db():
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS usuarios (id_discord TEXT PRIMARY KEY, saldo REAL)''')
     c.execute('''CREATE TABLE IF NOT EXISTS palpites_campeao (id_discord TEXT PRIMARY KEY, selecao TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS palpites_artilheiro (id_discord TEXT PRIMARY KEY, jogador TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS apostas (id_discord TEXT, jogo TEXT, palpite TEXT, valor REAL, odd REAL)''')
     conn.commit()
     conn.close()
@@ -73,8 +74,6 @@ def buscar_odds_do_dia():
                         "Vencedor_Fora": time_fora,
                         "Odd_Fora": odd_fora,
                         "Horario": horario_formatado,
-                        # FIX #3: guardamos o datetime real do jogo (não só o texto formatado)
-                        # para poder calcular o horário-limite de aposta corretamente.
                         "Horario_DT": horario_brasil,
                     }
 
@@ -89,7 +88,8 @@ async def jogoshoje(ctx):
     odds, status_ou_erro = buscar_odds_do_dia()
 
     if odds is None:
-        await ctx.send(f"❌ **Deu ruim ao buscar os jogos!**\n{status_ou_erro}")
+        await ctx.send("❌ **Ih, deu ruim!** Não consegui puxar os jogos. O dono do bot deve ter esquecido de pagar a conta da API.")
+        print(f"[ERRO NO !jogoshoje] {status_ou_erro}")
         return
 
     if not odds:
@@ -99,7 +99,6 @@ async def jogoshoje(ctx):
     embed = discord.Embed(title="⚽ Jogos e Odds de Hoje", color=discord.Color.green())
     for jogo, info in odds.items():
         texto = f"**{info['Vencedor_Casa']}** (Odd: {info['Odd_Casa']}) ou **{info['Vencedor_Fora']}** (Odd: {info['Odd_Fora']})\n⏰ Horário: {info['Horario']}"
-        # FIX #1: era embed.add_embed_field (não existe) -> corrigido para add_field
         embed.add_field(name=jogo, value=texto, inline=False)
 
     await ctx.send(embed=embed)
@@ -127,19 +126,17 @@ async def registrar(ctx):
 
 @bot.command()
 async def apostar(ctx, jogo: str, palpite: str, valor: float):
-    # FIX #2: buscar_odds_do_dia() retorna uma tupla (dict, status).
-    # Antes o código tratava a tupla inteira como se fosse o dicionário.
     odds, status_ou_erro = buscar_odds_do_dia()
 
     if odds is None:
-        await ctx.send(f"❌ **Deu ruim ao buscar os jogos!**\n{status_ou_erro}")
+        await ctx.send("❌ **Ih, deu ruim!** O sistema de apostas está fora do ar momentaneamente.")
+        print(f"[ERRO NO !apostar] {status_ou_erro}")
         return
 
     if jogo not in odds:
-        await ctx.send("❌ Jogo não encontrado. Use `!jogoshoje` para ver as opções.")
+        await ctx.send("❌ Jogo não encontrado. Use `!jogoshoje` para ver as opções disponíveis.")
         return
 
-    # FIX #3: usar o horário real do jogo (vindo da API) em vez de um horário fixo/hardcoded.
     horario_jogo = odds[jogo]["Horario_DT"]
     horario_limite = horario_jogo - timedelta(minutes=10)
 
@@ -150,9 +147,6 @@ async def apostar(ctx, jogo: str, palpite: str, valor: float):
     vencedor_casa = odds[jogo]["Vencedor_Casa"]
     vencedor_fora = odds[jogo]["Vencedor_Fora"]
 
-    # FIX #4: validar que o palpite é exatamente um dos dois times.
-    # Antes, qualquer palpite diferente do time da casa (inclusive um typo)
-    # era silenciosamente tratado como se fosse o time de fora.
     if palpite == vencedor_casa:
         odd_valida = odds[jogo]["Odd_Casa"]
     elif palpite == vencedor_fora:
@@ -191,19 +185,35 @@ async def apostar(ctx, jogo: str, palpite: str, valor: float):
     conn.close()
 
 @bot.command()
-async def campeao(ctx, selecao: str):
+async def campeao(ctx, *, selecao: str):
     conn = sqlite3.connect('bolao.db')
     c = conn.cursor()
     id_usuario = str(ctx.author.id)
+
+    c.execute("SELECT saldo FROM usuarios WHERE id_discord = ?", (id_usuario,))
+    resultado = c.fetchone()
+    
+    if not resultado:
+        await ctx.send("❌ Você não tem conta! Digite `!registrar` primeiro.")
+        conn.close()
+        return
+        
+    saldo_atual = resultado[0]
 
     c.execute("SELECT selecao FROM palpites_campeao WHERE id_discord = ?", (id_usuario,))
     aposta_existente = c.fetchone()
 
     if aposta_existente:
-        palpite_antigo = aposta_existente[0]
         taxa = 50.0
-        c.execute("UPDATE palpites_campeao SET selecao = ? WHERE id_discord = ?", (selecao, id_usuario))
-        await ctx.send(f"🔄 {ctx.author.mention} pagou a taxa de {taxa} Pilas e trocou o palpite de campeão de **{palpite_antigo}** para **{selecao}**!")
+        if saldo_atual < taxa:
+            await ctx.send(f"💸 Você está quebrado demais pra mudar de ideia! Trocar o palpite custa {taxa} Pilas, e você só tem {saldo_atual}.")
+        else:
+            palpite_antigo = aposta_existente[0]
+            novo_saldo = saldo_atual - taxa
+            
+            c.execute("UPDATE usuarios SET saldo = ? WHERE id_discord = ?", (novo_saldo, id_usuario))
+            c.execute("UPDATE palpites_campeao SET selecao = ? WHERE id_discord = ?", (selecao, id_usuario))
+            await ctx.send(f"🔄 {ctx.author.mention} pagou a taxa de {taxa} Pilas e trocou o palpite de campeão de **{palpite_antigo}** para **{selecao}**!\nSaldo restante: {novo_saldo} Pilas.")
     else:
         c.execute("INSERT INTO palpites_campeao (id_discord, selecao) VALUES (?, ?)", (id_usuario, selecao))
         await ctx.send(f"🏆 {ctx.author.mention} cravou que **{selecao}** será a campeã da Copa!")
@@ -212,23 +222,35 @@ async def campeao(ctx, selecao: str):
     conn.close()
 
 @bot.command()
-async def artilheiro(ctx, jogador: str):
+async def artilheiro(ctx, *, jogador: str):
     conn = sqlite3.connect('bolao.db')
     c = conn.cursor()
     id_usuario = str(ctx.author.id)
 
-    try:
-        c.execute("SELECT jogador FROM palpites_artilheiro WHERE id_discord = ?", (id_usuario,))
-        aposta_existente = c.fetchone()
-    except sqlite3.OperationalError:
-        c.execute('''CREATE TABLE IF NOT EXISTS palpites_artilheiro (id_discord TEXT PRIMARY KEY, jogador TEXT)''')
-        aposta_existente = None
+    c.execute("SELECT saldo FROM usuarios WHERE id_discord = ?", (id_usuario,))
+    resultado = c.fetchone()
+    
+    if not resultado:
+        await ctx.send("❌ Você não tem conta! Digite `!registrar` primeiro.")
+        conn.close()
+        return
+        
+    saldo_atual = resultado[0]
+
+    c.execute("SELECT jogador FROM palpites_artilheiro WHERE id_discord = ?", (id_usuario,))
+    aposta_existente = c.fetchone()
 
     if aposta_existente:
-        palpite_antigo = aposta_existente[0]
         taxa = 50.0
-        c.execute("UPDATE palpites_artilheiro SET jogador = ? WHERE id_discord = ?", (jogador, id_usuario))
-        await ctx.send(f"🔄 {ctx.author.mention} pagou a taxa de {taxa} Pilas e trocou o palpite de artilheiro de **{palpite_antigo}** para **{jogador}**!")
+        if saldo_atual < taxa:
+            await ctx.send(f"💸 Cadê o dinheiro? Trocar o palpite de artilheiro custa {taxa} Pilas, e você tem apenas {saldo_atual}.")
+        else:
+            palpite_antigo = aposta_existente[0]
+            novo_saldo = saldo_atual - taxa
+            
+            c.execute("UPDATE usuarios SET saldo = ? WHERE id_discord = ?", (novo_saldo, id_usuario))
+            c.execute("UPDATE palpites_artilheiro SET jogador = ? WHERE id_discord = ?", (jogador, id_usuario))
+            await ctx.send(f"🔄 {ctx.author.mention} pagou a taxa de {taxa} Pilas e trocou o palpite de artilheiro de **{palpite_antigo}** para **{jogador}**!\nSaldo restante: {novo_saldo} Pilas.")
     else:
         c.execute("INSERT INTO palpites_artilheiro (id_discord, jogador) VALUES (?, ?)", (id_usuario, jogador))
         await ctx.send(f"👟 {ctx.author.mention} cravou que **{jogador}** será o artilheiro da Copa!")
@@ -304,11 +326,8 @@ async def palpites(ctx):
     c.execute("SELECT selecao FROM palpites_campeao WHERE id_discord = ?", (id_usuario,))
     campeao_resultado = c.fetchone()
 
-    try:
-        c.execute("SELECT jogador FROM palpites_artilheiro WHERE id_discord = ?", (id_usuario,))
-        artilheiro_resultado = c.fetchone()
-    except sqlite3.OperationalError:
-        artilheiro_resultado = None
+    c.execute("SELECT jogador FROM palpites_artilheiro WHERE id_discord = ?", (id_usuario,))
+    artilheiro_resultado = c.fetchone()
 
     c.execute("SELECT jogo, palpite, valor, odd FROM apostas WHERE id_discord = ?", (id_usuario,))
     apostas_resultados = c.fetchall()
