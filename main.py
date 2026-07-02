@@ -101,7 +101,6 @@ async def aguardar_e_simular(channel, jogo_id, tempo_minutos, info):
     ch_casa = (prob_casa / total) * 100
     ch_fora = (prob_fora / total) * 100
     
-    # Sorteia com base nos pesos (odds)
     vencedor = random.choices([t_casa, t_fora], weights=[ch_casa, ch_fora], k=1)[0]
     
     await channel.send(f"⏰ **TEMPO ESGOTADO!** As apostas para **{jogo_id}** fecharam.\n"
@@ -289,7 +288,6 @@ class SimularModal(discord.ui.Modal, title="Criar Jogo Simulado (Admin)"):
             f"*(O resultado sairá sozinho assim que o tempo acabar)*"
         )
         
-        # Inicia a contagem regressiva em segundo plano (Assíncrono)
         bot.loop.create_task(aguardar_e_simular(interaction.channel, jogo_id, t_min, info))
 
 class ResultadoModal(discord.ui.Modal, title="Processar Resultado Oficial"):
@@ -390,10 +388,18 @@ async def processar_resultado_interno(channel, jogo: str, vencedor: str):
         if palpite == vencedor:
             lucro = int(valor * odd)
             c.execute("UPDATE usuarios SET saldo = ? WHERE id_discord = ?", (saldo + lucro, id_discord))
-            if odd >= 3.50: await channel.send(f"🦓 **VAI TOMANDO!** <@{id_discord}> faturou absurdos {lucro} Pilas numa zebra!")
-            else: await channel.send(f"✅ <@{id_discord}> ganhou a aposta e recebeu {lucro} Pilas!")
+            
+            if odd >= 3.50: 
+                await channel.send(f"🦓 **VAI TOMANDO!** A PLATAFORMA TA BUGADA! <@{id_discord}> faturou absurdos {lucro} Pilas numa zebra!")
+                await channel.send("https://media1.tenor.com/m/IoIaVLN2efsAAAAd/money-make-it-rain.gif")
+            else: 
+                await channel.send(f"✅ <@{id_discord}> ganhou a aposta e recebeu {lucro} Pilas!")
         else:
-            if saldo < 10: await channel.send(f"📉 **DEU RED!** O loss veio pesado pra <@{id_discord}>, hora de vender o celta.")
+            if valor >= 500: 
+                await channel.send(f"📉 **DEU RED!** O loss de {valor} Pilas veio pesado pra <@{id_discord}>, hora de vender o celta.")
+                await channel.send("https://media1.tenor.com/m/aSkdq3IU0g0AAAAd/laughing-cat.gif")
+            else:
+                await channel.send(f"❌ <@{id_discord}> apostou {valor} Pilas e se deu mal. Faz o PIX pra casa de apostas!")
 
     c.execute("DELETE FROM apostas WHERE jogo = ?", (jogo,))
     conn.commit()
@@ -419,6 +425,7 @@ async def pix(ctx):
     view = discord.ui.View()
     view.add_item(PixSelect())
     await ctx.send("💸 **Mercado Interno:** Selecione abaixo quem vai receber o PIX:", view=view)
+
 
 @bot.command()
 @commands.has_role("Pilantra BOT")
@@ -525,6 +532,108 @@ async def mendigar(ctx):
     conn.commit()
     conn.close()
     await ctx.send(f"🥺 O sistema teve pena. Você recebeu **100 Pilas**! Saldo: {novo}")
+
+
+@bot.command()
+async def ping(ctx):
+    await ctx.send(f"🏓 Pong! Latência: {round(bot.latency * 1000)}ms")
+
+@bot.command()
+async def comandos(ctx):
+    embed = discord.Embed(title="📜 Comandos do Pilantra BOT", color=discord.Color.blue())
+    embed.add_field(name="!registrar", value="Cria sua conta e recebe 1000 Pilas para começar.", inline=False)
+    embed.add_field(name="!saldo", value="Mostra seu saldo atual de Pilas.", inline=False)
+    embed.add_field(name="!jogos", value="Lista os jogos do dia com odds.", inline=False)
+    embed.add_field(name="!apostar", value="Abre o menu interativo para apostar nos jogos do dia.", inline=False)
+    embed.add_field(name="!palpites", value="Mostra seus palpites e apostas registradas.", inline=False)
+    embed.add_field(name="!pix", value="Transfere Pilas para outro usuário.", inline=False)
+    embed.add_field(name="!mendigar", value="Solicita 100 Pilas de graça (só pode uma vez a cada 24h).", inline=False)
+    embed.add_field(name="!ranking", value="Mostra o ranking dos usuários com mais Pilas.", inline=False)
+    embed.add_field(name="Administração", value="!resultado, !simular, !addsaldo, !remsaldo, !remaposta, !apostasDoDia", inline=False)
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def ranking(ctx):
+    conn = sqlite3.connect('bolao.db')
+    c = conn.cursor()
+    c.execute("SELECT id_discord, saldo FROM usuarios ORDER BY saldo DESC LIMIT 10")
+    top_usuarios = c.fetchall()
+    conn.close()
+
+    if not top_usuarios:
+        await ctx.send("📊 Nenhum usuário registrado ainda.")
+        return
+
+    embed = discord.Embed(title="🏆 Ranking dos Pilantras", color=discord.Color.gold())
+    for i, (id_discord, saldo) in enumerate(top_usuarios, start=1):
+        embed.add_field(name=f"{i}º Lugar", value=f"<@{id_discord}> — 💰 {saldo} Pilas", inline=False)
+
+    await ctx.send(embed=embed)
+
+@bot.command()
+@commands.has_role("Pilantra BOT")
+async def addsaldo(ctx, membro: discord.Member, valor: int):
+    conn = sqlite3.connect('bolao.db')
+    c = conn.cursor()
+    c.execute("SELECT saldo FROM usuarios WHERE id_discord = ?", (str(membro.id),))
+    res = c.fetchone()
+    if res:
+        novo_saldo = int(res[0]) + valor
+        c.execute("UPDATE usuarios SET saldo = ? WHERE id_discord = ?", (novo_saldo, str(membro.id)))
+        await ctx.send(f"🏦 **Administração:** {valor} Pilas injetados na conta de {membro.mention}. Novo saldo: {novo_saldo}")
+    else:
+        await ctx.send("❌ Esse usuário não está registrado no bot.")
+    conn.commit()
+    conn.close()
+
+@bot.command()
+@commands.has_role("Pilantra BOT")
+async def remsaldo(ctx, membro: discord.Member, valor: int):
+    conn = sqlite3.connect('bolao.db')
+    c = conn.cursor()
+    c.execute("SELECT saldo FROM usuarios WHERE id_discord = ?", (str(membro.id),))
+    res = c.fetchone()
+    if res:
+        novo_saldo = int(res[0]) - valor
+        c.execute("UPDATE usuarios SET saldo = ? WHERE id_discord = ?", (novo_saldo, str(membro.id)))
+        await ctx.send(f"🏦 **Administração:** {valor} Pilas removidos da conta de {membro.mention}. Novo saldo: {novo_saldo}")
+    else:
+        await ctx.send("❌ Esse usuário não está registrado no bot.")
+    conn.commit()
+    conn.close()
+
+@bot.command()
+@commands.has_role("Pilantra BOT")
+async def remaposta(ctx, membro: discord.Member, *, jogo: str):
+    conn = sqlite3.connect('bolao.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM apostas WHERE id_discord = ? AND jogo = ?", (str(membro.id), jogo))
+    if c.rowcount > 0:
+        await ctx.send(f"🗑️ Aposta de {membro.mention} no jogo **{jogo}** foi cancelada. (Atenção: o saldo não foi devolvido automaticamente, use `!addsaldo` se necessário).")
+    else:
+        await ctx.send("❌ Nenhuma aposta encontrada com esses dados.")
+    conn.commit()
+    conn.close()
+
+@bot.command()
+@commands.has_role("Pilantra BOT")
+async def apostasDoDia(ctx):
+    conn = sqlite3.connect('bolao.db')
+    c = conn.cursor()
+    c.execute("SELECT id_discord, jogo, palpite, valor, odd FROM apostas")
+    apostas = c.fetchall()
+    conn.close()
+
+    if not apostas:
+        await ctx.send("📅 Nenhuma aposta registrada hoje.")
+        return
+
+    embed = discord.Embed(title="📅 Apostas Ativas", color=discord.Color.purple())
+    for aposta in apostas:
+        id_discord, jogo, palpite, valor, odd = aposta
+        embed.add_field(name=jogo, value=f"<@{id_discord}> apostou em **{palpite}** | 💸 {int(valor)} Pilas (Odd: {odd})", inline=False)
+    
+    await ctx.send(embed=embed)
 
 @bot.event
 async def on_command_error(ctx, error):
