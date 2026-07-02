@@ -391,15 +391,18 @@ async def processar_resultado_interno(channel, jogo: str, vencedor: str):
             
             if odd >= 3.50: 
                 await channel.send(f"🦓 **VAI TOMANDO!** A PLATAFORMA TA BUGADA! <@{id_discord}> faturou absurdos {lucro} Pilas numa zebra!")
-                await channel.send("https://media1.tenor.com/m/IoIaVLN2efsAAAAd/money-make-it-rain.gif")
+                await channel.send("https://c.tenor.com/IoIaVLN2efsAAAAd/tenor.gif")
+                await channel.send("")
             else: 
                 await channel.send(f"✅ <@{id_discord}> ganhou a aposta e recebeu {lucro} Pilas!")
         else:
             if valor >= 500: 
                 await channel.send(f"📉 **DEU RED!** O loss de {valor} Pilas veio pesado pra <@{id_discord}>, hora de vender o celta.")
-                await channel.send("https://media1.tenor.com/m/aSkdq3IU0g0AAAAd/laughing-cat.gif")
+                await channel.send("https://c.tenor.com/aSkdq3IU0g0AAAAd/tenor.gif")
+                await channel.send("")
             else:
                 await channel.send(f"❌ <@{id_discord}> apostou {valor} Pilas e se deu mal. Faz o PIX pra casa de apostas!")
+                await channel.send("")
 
     c.execute("DELETE FROM apostas WHERE jogo = ?", (jogo,))
     conn.commit()
