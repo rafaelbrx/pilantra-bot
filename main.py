@@ -243,6 +243,20 @@ class SimplesButtonView(discord.ui.View):
     async def abrir_modal(self, interaction: discord.Interaction):
         await interaction.response.send_modal(self.modal_class())
 
+class AdminButtonView(discord.ui.View):
+    def __init__(self, modal_class, label="Abrir Formulário"):
+        super().__init__(timeout=60)
+        self.modal_class = modal_class
+        btn = discord.ui.Button(label=label, style=discord.ButtonStyle.danger)
+        btn.callback = self.abrir_modal
+        self.add_item(btn)
+
+    async def abrir_modal(self, interaction: discord.Interaction):
+        if not any(role.name == "Pilantra BOT" for role in interaction.user.roles):
+            return await interaction.response.send_message(f"⛔ Tira a mãozinha daí <@{interaction.user.id}>! Só administradores podem usar este botão.", ephemeral=True)
+        
+        await interaction.response.send_modal(self.modal_class())
+
 class SimularModal(discord.ui.Modal, title="Criar Jogo Simulado (Admin)"):
     t_casa = discord.ui.TextInput(label="Time da Casa", placeholder="Ex: Flamengo", required=True)
     o_casa = discord.ui.TextInput(label="Odd da Casa (Ex: 1.50)", placeholder="1.50", style=discord.TextStyle.short, required=True)
@@ -433,13 +447,12 @@ async def pix(ctx):
 @bot.command()
 @commands.has_role("Pilantra BOT")
 async def simular(ctx):
-    await ctx.send("🎲 Clique para criar seu Evento de Cassino:", view=SimplesButtonView(SimularModal, "Criar Evento"))
+    await ctx.send("🎲 Clique para criar seu Evento de Cassino:", view=AdminButtonView(SimularModal, "Criar Evento"))
 
 @bot.command()
 @commands.has_role("Pilantra BOT")
 async def resultado(ctx):
-    await ctx.send("⚽ Clique para informar quem venceu:", view=SimplesButtonView(ResultadoModal, "Informar Resultado"))
-
+    await ctx.send("⚽ Clique para informar quem venceu:", view=AdminButtonView(ResultadoModal, "Informar Resultado"))
 
 @bot.command()
 async def registrar(ctx):
