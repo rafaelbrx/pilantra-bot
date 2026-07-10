@@ -2,52 +2,25 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 import os
-import sqlite3
 import requests
 import random
 import asyncio
 from datetime import datetime, timedelta
 from keep_alive import keep_alive
+from db import get_conn, init_db
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Slash commands não dependem de ler o conteúdo das mensagens, então não
-# precisamos mais do intent privilegiado message_content.
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Opcional: se você definir DEV_GUILD_ID no .env / Render, os slash commands
-# são sincronizados instantaneamente NESSE servidor (ótimo pra testar).
-# Sem essa variável, a sincronização é global e pode levar até 1h pra propagar.
 DEV_GUILD_ID = os.environ.get('DEV_GUILD_ID')
 
-# Canais fixos usados pelos avisos automáticos (resultado ao vivo e ranking diário)
 CANAL_RESULTADOS_ID = 1523044681313681449
 CANAL_RANKING_ID = 1523039770337480874
 
 jogos_simulados = {}
-
-
-def init_db():
-    conn = sqlite3.connect('bolao.db', timeout=10)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS usuarios (id_discord TEXT PRIMARY KEY, saldo INTEGER)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS palpites_campeao (id_discord TEXT PRIMARY KEY, selecao TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS palpites_artilheiro (id_discord TEXT PRIMARY KEY, jogador TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS apostas (id_discord TEXT, jogo TEXT, palpite TEXT, valor INTEGER, odd REAL)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS horarios_jogos (jogo TEXT PRIMARY KEY, horario_dt TEXT)''')
-    # FIX: jogos simulados agora são persistidos, não vivem só na memória.
-    # Isso permite recuperar/reembolsar apostas se o bot reiniciar no meio de uma rodada.
-    c.execute('''CREATE TABLE IF NOT EXISTS jogos_simulados_db (
-                    jogo TEXT PRIMARY KEY,
-                    t_casa TEXT, odd_casa REAL,
-                    t_fora TEXT, odd_fora REAL,
-                    horario_resolucao TEXT,
-                    channel_id INTEGER
-                 )''')
-    conn.commit()
-    conn.close()
 
 
 init_db()
@@ -71,7 +44,7 @@ def buscar_odds_do_dia():
         dados = resposta.json()
         odds_do_dia = {}
 
-        conn = sqlite3.connect('bolao.db', timeout=10)
+        conn = get_conn()
         c = conn.cursor()
 
         for jogo in dados:
@@ -96,7 +69,8 @@ def buscar_odds_do_dia():
 
                     chave_jogo = f"{time_casa} x {time_fora}"
 
-                    c.execute("INSERT OR REPLACE INTO horarios_jogos (jogo, horario_dt) VALUES (?, ?)",
+                    c.execute("""INSERT INTO horarios_jogos (jogo, horario_dt) VALUES (%s, %s)
+                                 ON CONFLICT (jogo) DO UPDATE SET horario_dt = EXCLUDED.horario_dt""",
                               (chave_jogo, horario_brasil.isoformat()))
 
                     odds_do_dia[chave_jogo] = {
@@ -116,7 +90,6 @@ def buscar_odds_do_dia():
 
 
 def buscar_resultados_api():
-    """Busca placares ao vivo/finalizados na The Odds API."""
     API_KEY = os.environ.get('ODDS_API_KEY')
     if not API_KEY:
         return None
@@ -132,8 +105,6 @@ def buscar_resultados_api():
 
 
 async def obter_todas_odds():
-    # FIX: chamadas de rede (requests.get) são bloqueantes; rodamos em thread
-    # separada pra não travar o loop de eventos do bot inteiro enquanto a API responde.
     odds, _ = await asyncio.to_thread(buscar_odds_do_dia)
     if odds is None:
         odds = {}
@@ -142,7 +113,7 @@ async def obter_todas_odds():
 
 
 def gerar_embed_ranking():
-    conn = sqlite3.connect('bolao.db', timeout=10)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT id_discord, saldo FROM usuarios ORDER BY saldo DESC LIMIT 10")
     top_usuarios = c.fetchall()
@@ -178,11 +149,16 @@ def gerar_embed_ranking():
 # ---------------------------------------------------------------------------
 
 def salvar_jogo_simulado_db(jogo_id, info, channel_id, horario_resolucao):
-    conn = sqlite3.connect('bolao.db', timeout=10)
+    conn = get_conn()
     c = conn.cursor()
-    c.execute("""INSERT OR REPLACE INTO jogos_simulados_db
+    c.execute("""INSERT INTO jogos_simulados_db
                  (jogo, t_casa, odd_casa, t_fora, odd_fora, horario_resolucao, channel_id)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                 VALUES (%s, %s, %s, %s, %s, %s, %s)
+                 ON CONFLICT (jogo) DO UPDATE SET
+                     t_casa = EXCLUDED.t_casa, odd_casa = EXCLUDED.odd_casa,
+                     t_fora = EXCLUDED.t_fora, odd_fora = EXCLUDED.odd_fora,
+                     horario_resolucao = EXCLUDED.horario_resolucao,
+                     channel_id = EXCLUDED.channel_id""",
               (jogo_id, info["Vencedor_Casa"], info["Odd_Casa"], info["Vencedor_Fora"], info["Odd_Fora"],
                horario_resolucao.isoformat(), channel_id))
     conn.commit()
@@ -190,42 +166,38 @@ def salvar_jogo_simulado_db(jogo_id, info, channel_id, horario_resolucao):
 
 
 def remover_jogo_simulado_db(jogo_id):
-    conn = sqlite3.connect('bolao.db', timeout=10)
+    conn = get_conn()
     c = conn.cursor()
-    c.execute("DELETE FROM jogos_simulados_db WHERE jogo = ?", (jogo_id,))
+    c.execute("DELETE FROM jogos_simulados_db WHERE jogo = %s", (jogo_id,))
     conn.commit()
     conn.close()
 
 
 def reconciliar_apostas_orfas():
-    """FIX: roda no startup. Se existir aposta referenciando um jogo que não
-    está nem em horarios_jogos (partida real) nem em jogos_simulados_db
-    (evento de cassino pendente), esse jogo é órfão — provavelmente por causa
-    de um restart no meio de uma rodada. Reembolsa quem apostou nele."""
-    conn = sqlite3.connect('bolao.db', timeout=10)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT DISTINCT jogo FROM apostas")
     jogos_com_aposta = [r[0] for r in c.fetchall()]
 
     for jogo in jogos_com_aposta:
-        c.execute("SELECT 1 FROM horarios_jogos WHERE jogo = ?", (jogo,))
+        c.execute("SELECT 1 FROM horarios_jogos WHERE jogo = %s", (jogo,))
         eh_real = c.fetchone()
-        c.execute("SELECT 1 FROM jogos_simulados_db WHERE jogo = ?", (jogo,))
+        c.execute("SELECT 1 FROM jogos_simulados_db WHERE jogo = %s", (jogo,))
         eh_simulado_pendente = c.fetchone()
 
         if eh_real or eh_simulado_pendente:
             continue
 
-        c.execute("SELECT id_discord, valor FROM apostas WHERE jogo = ?", (jogo,))
+        c.execute("SELECT id_discord, valor FROM apostas WHERE jogo = %s", (jogo,))
         apostas_orfas = c.fetchall()
         for id_discord, valor in apostas_orfas:
-            c.execute("SELECT saldo FROM usuarios WHERE id_discord = ?", (id_discord,))
+            c.execute("SELECT saldo FROM usuarios WHERE id_discord = %s", (id_discord,))
             res = c.fetchone()
             if res:
                 novo_saldo = int(res[0]) + int(valor)
-                c.execute("UPDATE usuarios SET saldo = ? WHERE id_discord = ?", (novo_saldo, id_discord))
+                c.execute("UPDATE usuarios SET saldo = %s WHERE id_discord = %s", (novo_saldo, id_discord))
 
-        c.execute("DELETE FROM apostas WHERE jogo = ?", (jogo,))
+        c.execute("DELETE FROM apostas WHERE jogo = %s", (jogo,))
         print(f"[reconciliação] Jogo órfão '{jogo}' encontrado no startup — apostas reembolsadas automaticamente.")
 
     conn.commit()
@@ -236,7 +208,7 @@ async def retomar_simulacoes():
     """FIX: no startup, recarrega jogos de cassino que ainda não foram
     resolvidos (o bot reiniciou no meio da rodada) e retoma o timer, ou
     resolve na hora se o tempo já tiver estourado."""
-    conn = sqlite3.connect('bolao.db', timeout=10)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT jogo, t_casa, odd_casa, t_fora, odd_fora, horario_resolucao, channel_id FROM jogos_simulados_db")
     rows = c.fetchall()
@@ -303,8 +275,6 @@ async def aguardar_e_simular(channel, jogo_id, segundos, info):
         await asyncio.sleep(segundos)
         await resolver_simulacao(channel, jogo_id, info)
     except Exception as e:
-        # FIX: se qualquer coisa falhar aqui (permissão no canal, canal apagado, etc.)
-        # a task não deve morrer silenciosamente deixando o jogo preso.
         print(f"[aguardar_e_simular] Erro ao resolver '{jogo_id}': {e}")
     finally:
         if jogo_id in jogos_simulados:
@@ -317,9 +287,9 @@ async def aguardar_e_simular(channel, jogo_id, segundos, info):
 # ---------------------------------------------------------------------------
 
 async def processar_resultado_interno(channel, jogo: str, vencedor: str):
-    conn = sqlite3.connect('bolao.db', timeout=10)
+    conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT id_discord, palpite, valor, odd FROM apostas WHERE jogo = ?", (jogo,))
+    c.execute("SELECT id_discord, palpite, valor, odd FROM apostas WHERE jogo = %s", (jogo,))
     apostas = c.fetchall()
 
     if not apostas:
@@ -327,9 +297,6 @@ async def processar_resultado_interno(channel, jogo: str, vencedor: str):
         conn.close()
         return
 
-    # FIX: empate agora é tratado explicitamente. Como o mercado só tem odd de
-    # casa/fora (sem opção de empate pra apostar), ninguém "erra" um empate —
-    # o valor apostado é devolvido pra todo mundo, sem lucro nem prejuízo.
     eh_empate = vencedor.strip().lower() in ("empate", "draw", "tie")
 
     if eh_empate:
@@ -338,7 +305,7 @@ async def processar_resultado_interno(channel, jogo: str, vencedor: str):
 
     for aposta in apostas:
         id_discord, palpite, valor, odd = aposta
-        c.execute("SELECT saldo FROM usuarios WHERE id_discord = ?", (id_discord,))
+        c.execute("SELECT saldo FROM usuarios WHERE id_discord = %s", (id_discord,))
         res = c.fetchone()
         if not res:
             continue
@@ -346,16 +313,16 @@ async def processar_resultado_interno(channel, jogo: str, vencedor: str):
 
         if eh_empate:
             novo_saldo = saldo + int(valor)
-            c.execute("UPDATE usuarios SET saldo = ? WHERE id_discord = ?", (novo_saldo, id_discord))
+            c.execute("UPDATE usuarios SET saldo = %s WHERE id_discord = %s", (novo_saldo, id_discord))
             await channel.send(f"↩️ <@{id_discord}> recebeu de volta **{int(valor)} Pilas** (aposta cancelada por empate).")
             continue
 
         if palpite == vencedor:
             lucro = int(valor * odd)
-            c.execute("UPDATE usuarios SET saldo = ? WHERE id_discord = ?", (saldo + lucro, id_discord))
+            c.execute("UPDATE usuarios SET saldo = %s WHERE id_discord = %s", (saldo + lucro, id_discord))
 
             if odd >= 3.50:
-                await channel.send(f"🦓 **VAI TOMANDO!** A PLATAFORMA TA BUGADA! <@{id_discord}> faturou absurdos {lucro} Pilas numa zebra!")
+                await channel.send(f"🦓 **A PLATAFORMA TA BUGADA!** <@{id_discord}> faturou absurdos {lucro} Pilas numa zebra!")
                 await channel.send("https://c.tenor.com/IoIaVLN2efsAAAAd/tenor.gif")
             else:
                 await channel.send(f"✅ <@{id_discord}> ganhou a aposta e recebeu {lucro} Pilas!")
@@ -366,14 +333,14 @@ async def processar_resultado_interno(channel, jogo: str, vencedor: str):
             else:
                 await channel.send(f"❌ <@{id_discord}> apostou {valor} Pilas e se deu mal. Faz o PIX pra casa de apostas!")
 
-    c.execute("DELETE FROM apostas WHERE jogo = ?", (jogo,))
+    c.execute("DELETE FROM apostas WHERE jogo = %s", (jogo,))
     conn.commit()
     conn.close()
 
 
 @tasks.loop(minutes=5)
 async def verificar_resultados_loop():
-    conn = sqlite3.connect('bolao.db', timeout=10)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT DISTINCT jogo FROM apostas")
     jogos_pendentes = [row[0] for row in c.fetchall()]
@@ -387,9 +354,9 @@ async def verificar_resultados_loop():
 
     for jogo in jogos_pendentes:
         if jogo in jogos_simulados:
-            continue  # jogos simulados são resolvidos pelo próprio timer, não pela API
+            continue
 
-        c.execute("SELECT horario_dt FROM horarios_jogos WHERE jogo = ?", (jogo,))
+        c.execute("SELECT horario_dt FROM horarios_jogos WHERE jogo = %s", (jogo,))
         res = c.fetchone()
         if res:
             horario_dt = datetime.fromisoformat(res[0])
@@ -405,7 +372,6 @@ async def verificar_resultados_loop():
     if not precisa_chamar_api:
         return
 
-    # FIX: chamada de rede rodando em thread separada pra não travar o bot por 5 min em 5 min
     dados = await asyncio.to_thread(buscar_resultados_api)
     if not dados:
         return
@@ -438,7 +404,6 @@ async def verificar_resultados_loop():
                         await channel.send(f"🚨 **O JOGO ACABOU!**\n⚽ Placar Final: **{t_casa} {score_casa} x {score_fora} {t_fora}**\nProcessando os pagamentos do bot...")
                         await processar_resultado_interno(channel, jogo_id, vencedor)
                     else:
-                        # FIX: antes isso falhava em silêncio; agora fica registrado no log.
                         print(f"[verificar_resultados_loop] Canal de resultados ({CANAL_RESULTADOS_ID}) não encontrado — não consegui anunciar '{jogo_id}'.")
 
 
@@ -476,10 +441,10 @@ class ApostaModal(discord.ui.Modal, title="Sua Aposta"):
             return await interaction.response.send_message("❌ Digite um número inteiro maior que zero!", ephemeral=True)
 
         id_usuario = str(interaction.user.id)
-        conn = sqlite3.connect('bolao.db', timeout=10)
+        conn = get_conn()
         c = conn.cursor()
         try:
-            c.execute("SELECT saldo FROM usuarios WHERE id_discord = ?", (id_usuario,))
+            c.execute("SELECT saldo FROM usuarios WHERE id_discord = %s", (id_usuario,))
             res = c.fetchone()
             if not res:
                 return await interaction.response.send_message("❌ Você não tem conta! Use `/registrar`.", ephemeral=True)
@@ -489,8 +454,8 @@ class ApostaModal(discord.ui.Modal, title="Sua Aposta"):
                 return await interaction.response.send_message(f"💸 Saldo insuficiente! Você só tem {saldo} Pilas.", ephemeral=True)
 
             novo_saldo = saldo - valor_int
-            c.execute("UPDATE usuarios SET saldo = ? WHERE id_discord = ?", (novo_saldo, id_usuario))
-            c.execute("INSERT INTO apostas (id_discord, jogo, palpite, valor, odd) VALUES (?, ?, ?, ?, ?)",
+            c.execute("UPDATE usuarios SET saldo = %s WHERE id_discord = %s", (novo_saldo, id_usuario))
+            c.execute("INSERT INTO apostas (id_discord, jogo, palpite, valor, odd) VALUES (%s, %s, %s, %s, %s)",
                       (id_usuario, self.jogo, self.palpite, valor_int, self.odd))
             conn.commit()
         finally:
@@ -503,17 +468,17 @@ class CampeaoModal(discord.ui.Modal, title="Palpite de Campeão"):
     selecao = discord.ui.TextInput(label="Qual seleção será a campeã?", placeholder="Ex: Brasil", required=True)
 
     async def on_submit(self, interaction: discord.Interaction):
-        conn = sqlite3.connect('bolao.db', timeout=10)
+        conn = get_conn()
         c = conn.cursor()
         id_usuario = str(interaction.user.id)
         try:
-            c.execute("SELECT saldo FROM usuarios WHERE id_discord = ?", (id_usuario,))
+            c.execute("SELECT saldo FROM usuarios WHERE id_discord = %s", (id_usuario,))
             resultado = c.fetchone()
             if not resultado:
                 return await interaction.response.send_message("❌ Você não tem conta! Use `/registrar`.", ephemeral=True)
 
             saldo_atual = int(resultado[0])
-            c.execute("SELECT selecao FROM palpites_campeao WHERE id_discord = ?", (id_usuario,))
+            c.execute("SELECT selecao FROM palpites_campeao WHERE id_discord = %s", (id_usuario,))
             aposta_existente = c.fetchone()
 
             if aposta_existente:
@@ -522,11 +487,11 @@ class CampeaoModal(discord.ui.Modal, title="Palpite de Campeão"):
                     return await interaction.response.send_message(f"💸 Cadê o dinheiro? Trocar o palpite custa {taxa} Pilas, e você só tem {saldo_atual}.", ephemeral=True)
                 palpite_antigo = aposta_existente[0]
                 novo_saldo = saldo_atual - taxa
-                c.execute("UPDATE usuarios SET saldo = ? WHERE id_discord = ?", (novo_saldo, id_usuario))
-                c.execute("UPDATE palpites_campeao SET selecao = ? WHERE id_discord = ?", (self.selecao.value, id_usuario))
+                c.execute("UPDATE usuarios SET saldo = %s WHERE id_discord = %s", (novo_saldo, id_usuario))
+                c.execute("UPDATE palpites_campeao SET selecao = %s WHERE id_discord = %s", (self.selecao.value, id_usuario))
                 await interaction.response.send_message(f"🔄 {interaction.user.mention} pagou {taxa} Pilas e trocou o palpite de campeão de **{palpite_antigo}** para **{self.selecao.value}**!\nSaldo: {novo_saldo} Pilas.")
             else:
-                c.execute("INSERT INTO palpites_campeao (id_discord, selecao) VALUES (?, ?)", (id_usuario, self.selecao.value))
+                c.execute("INSERT INTO palpites_campeao (id_discord, selecao) VALUES (%s, %s)", (id_usuario, self.selecao.value))
                 await interaction.response.send_message(f"🏆 {interaction.user.mention} cravou que **{self.selecao.value}** será a campeã da Copa!")
             conn.commit()
         finally:
@@ -537,17 +502,17 @@ class ArtilheiroModal(discord.ui.Modal, title="Palpite de Artilheiro"):
     jogador = discord.ui.TextInput(label="Quem será o artilheiro?", placeholder="Ex: Neymar", required=True)
 
     async def on_submit(self, interaction: discord.Interaction):
-        conn = sqlite3.connect('bolao.db', timeout=10)
+        conn = get_conn()
         c = conn.cursor()
         id_usuario = str(interaction.user.id)
         try:
-            c.execute("SELECT saldo FROM usuarios WHERE id_discord = ?", (id_usuario,))
+            c.execute("SELECT saldo FROM usuarios WHERE id_discord = %s", (id_usuario,))
             resultado = c.fetchone()
             if not resultado:
                 return await interaction.response.send_message("❌ Você não tem conta! Use `/registrar`.", ephemeral=True)
 
             saldo_atual = int(resultado[0])
-            c.execute("SELECT jogador FROM palpites_artilheiro WHERE id_discord = ?", (id_usuario,))
+            c.execute("SELECT jogador FROM palpites_artilheiro WHERE id_discord = %s", (id_usuario,))
             aposta_existente = c.fetchone()
 
             if aposta_existente:
@@ -556,11 +521,11 @@ class ArtilheiroModal(discord.ui.Modal, title="Palpite de Artilheiro"):
                     return await interaction.response.send_message(f"💸 Tá quebrado! Trocar o artilheiro custa {taxa} Pilas, e você tem apenas {saldo_atual}.", ephemeral=True)
                 palpite_antigo = aposta_existente[0]
                 novo_saldo = saldo_atual - taxa
-                c.execute("UPDATE usuarios SET saldo = ? WHERE id_discord = ?", (novo_saldo, id_usuario))
-                c.execute("UPDATE palpites_artilheiro SET jogador = ? WHERE id_discord = ?", (self.jogador.value, id_usuario))
+                c.execute("UPDATE usuarios SET saldo = %s WHERE id_discord = %s", (novo_saldo, id_usuario))
+                c.execute("UPDATE palpites_artilheiro SET jogador = %s WHERE id_discord = %s", (self.jogador.value, id_usuario))
                 await interaction.response.send_message(f"🔄 {interaction.user.mention} pagou {taxa} Pilas e trocou o palpite de artilheiro de **{palpite_antigo}** para **{self.jogador.value}**!\nSaldo: {novo_saldo} Pilas.")
             else:
-                c.execute("INSERT INTO palpites_artilheiro (id_discord, jogador) VALUES (?, ?)", (id_usuario, self.jogador.value))
+                c.execute("INSERT INTO palpites_artilheiro (id_discord, jogador) VALUES (%s, %s)", (id_usuario, self.jogador.value))
                 await interaction.response.send_message(f"👟 {interaction.user.mention} cravou que **{self.jogador.value}** será o artilheiro da Copa!")
             conn.commit()
         finally:
@@ -582,12 +547,12 @@ class PixModal(discord.ui.Modal, title="Fazer um PIX"):
         except ValueError:
             return await interaction.response.send_message("❌ Digite um valor numérico inteiro maior que zero!", ephemeral=True)
 
-        conn = sqlite3.connect('bolao.db', timeout=10)
+        conn = get_conn()
         c = conn.cursor()
         try:
-            c.execute("SELECT saldo FROM usuarios WHERE id_discord = ?", (str(interaction.user.id),))
+            c.execute("SELECT saldo FROM usuarios WHERE id_discord = %s", (str(interaction.user.id),))
             remetente = c.fetchone()
-            c.execute("SELECT saldo FROM usuarios WHERE id_discord = ?", (str(self.destinatario.id),))
+            c.execute("SELECT saldo FROM usuarios WHERE id_discord = %s", (str(self.destinatario.id),))
             destinatario_db = c.fetchone()
 
             if not remetente:
@@ -599,8 +564,8 @@ class PixModal(discord.ui.Modal, title="Fazer um PIX"):
             else:
                 novo_remetente = int(remetente[0]) - valor_int
                 novo_destinatario = int(destinatario_db[0]) + valor_int
-                c.execute("UPDATE usuarios SET saldo = ? WHERE id_discord = ?", (novo_remetente, str(interaction.user.id)))
-                c.execute("UPDATE usuarios SET saldo = ? WHERE id_discord = ?", (novo_destinatario, str(self.destinatario.id)))
+                c.execute("UPDATE usuarios SET saldo = %s WHERE id_discord = %s", (novo_remetente, str(interaction.user.id)))
+                c.execute("UPDATE usuarios SET saldo = %s WHERE id_discord = %s", (novo_destinatario, str(self.destinatario.id)))
                 await interaction.response.send_message(f"💸 **PIX REALIZADO!** {interaction.user.mention} transferiu **{valor_int} Pilas** para {self.destinatario.mention}!")
             conn.commit()
         finally:
@@ -682,9 +647,6 @@ class AdminButtonView(discord.ui.View):
         self.add_item(btn)
 
     async def abrir_modal(self, interaction: discord.Interaction):
-        # Esse botão fica visível pra qualquer um no canal, então o cargo
-        # precisa ser checado de novo aqui (o decorator do slash command só
-        # protege quem RODA o comando, não quem clica no botão depois).
         if not any(role.name == "Pilantra BOT" for role in interaction.user.roles):
             return await interaction.response.send_message("⛔ Tira a mãozinha daí! Só administradores podem usar este botão.", ephemeral=True)
         await interaction.response.send_modal(self.modal_class())
@@ -788,14 +750,14 @@ async def resultado(interaction: discord.Interaction):
 
 @bot.tree.command(name="registrar", description="Cria sua conta e recebe 1000 Pilas para começar")
 async def registrar(interaction: discord.Interaction):
-    conn = sqlite3.connect('bolao.db', timeout=10)
+    conn = get_conn()
     c = conn.cursor()
     id_usuario = str(interaction.user.id)
-    c.execute("SELECT saldo FROM usuarios WHERE id_discord = ?", (id_usuario,))
+    c.execute("SELECT saldo FROM usuarios WHERE id_discord = %s", (id_usuario,))
     if c.fetchone():
         await interaction.response.send_message(f"⚠️ {interaction.user.mention}, você já é um Pilantra!")
     else:
-        c.execute("INSERT INTO usuarios (id_discord, saldo) VALUES (?, ?)", (id_usuario, 1000))
+        c.execute("INSERT INTO usuarios (id_discord, saldo) VALUES (%s, %s)", (id_usuario, 1000))
         await interaction.response.send_message(f"🎉 Bem-vindo ao vício, {interaction.user.mention}! Você recebeu **1000 Pilas**.")
         await interaction.followup.send("https://media.tenor.com/i-gbL-IgbbYAAAAi/dodep2.gif")
     conn.commit()
@@ -804,9 +766,9 @@ async def registrar(interaction: discord.Interaction):
 
 @bot.tree.command(name="saldo", description="Mostra seu saldo atual de Pilas")
 async def saldo(interaction: discord.Interaction):
-    conn = sqlite3.connect('bolao.db', timeout=10)
+    conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT saldo FROM usuarios WHERE id_discord = ?", (str(interaction.user.id),))
+    c.execute("SELECT saldo FROM usuarios WHERE id_discord = %s", (str(interaction.user.id),))
     res = c.fetchone()
     conn.close()
     if res:
@@ -829,14 +791,14 @@ async def jogos(interaction: discord.Interaction):
 
 @bot.tree.command(name="palpites", description="Mostra seus palpites e apostas registradas")
 async def palpites(interaction: discord.Interaction):
-    conn = sqlite3.connect('bolao.db', timeout=10)
+    conn = get_conn()
     c = conn.cursor()
     id_us = str(interaction.user.id)
-    c.execute("SELECT selecao FROM palpites_campeao WHERE id_discord = ?", (id_us,))
+    c.execute("SELECT selecao FROM palpites_campeao WHERE id_discord = %s", (id_us,))
     camp = c.fetchone()
-    c.execute("SELECT jogador FROM palpites_artilheiro WHERE id_discord = ?", (id_us,))
+    c.execute("SELECT jogador FROM palpites_artilheiro WHERE id_discord = %s", (id_us,))
     art = c.fetchone()
-    c.execute("SELECT jogo, palpite, valor, odd FROM apostas WHERE id_discord = ?", (id_us,))
+    c.execute("SELECT jogo, palpite, valor, odd FROM apostas WHERE id_discord = %s", (id_us,))
     apostas = c.fetchall()
     conn.close()
 
@@ -856,10 +818,10 @@ async def palpites(interaction: discord.Interaction):
 @bot.tree.command(name="salario", description="Resgata 350 Pilas de salário (a cada 72h)")
 @app_commands.checks.cooldown(1, 259200)
 async def salario(interaction: discord.Interaction):
-    conn = sqlite3.connect('bolao.db', timeout=10)
+    conn = get_conn()
     c = conn.cursor()
     try:
-        c.execute("SELECT saldo FROM usuarios WHERE id_discord = ?", (str(interaction.user.id),))
+        c.execute("SELECT saldo FROM usuarios WHERE id_discord = %s", (str(interaction.user.id),))
         res = c.fetchone()
         if not res:
             try:
@@ -868,7 +830,7 @@ async def salario(interaction: discord.Interaction):
                 pass
             return await interaction.response.send_message("❌ Você não tem conta! Use `/registrar`.")
         novo = int(res[0]) + 350
-        c.execute("UPDATE usuarios SET saldo = ? WHERE id_discord = ?", (novo, str(interaction.user.id)))
+        c.execute("UPDATE usuarios SET saldo = %s WHERE id_discord = %s", (novo, str(interaction.user.id)))
         conn.commit()
     finally:
         conn.close()
@@ -878,10 +840,10 @@ async def salario(interaction: discord.Interaction):
 @bot.tree.command(name="mendigar", description="Pede 100 Pilas de graça (a cada 24h, só se estiver quebrado)")
 @app_commands.checks.cooldown(1, 86400)
 async def mendigar(interaction: discord.Interaction):
-    conn = sqlite3.connect('bolao.db', timeout=10)
+    conn = get_conn()
     c = conn.cursor()
     try:
-        c.execute("SELECT saldo FROM usuarios WHERE id_discord = ?", (str(interaction.user.id),))
+        c.execute("SELECT saldo FROM usuarios WHERE id_discord = %s", (str(interaction.user.id),))
         res = c.fetchone()
         if not res:
             try:
@@ -899,7 +861,7 @@ async def mendigar(interaction: discord.Interaction):
             return await interaction.response.send_message(f"🛑 Você ainda tem {saldo_atual} Pilas. Vá apostar!")
 
         novo = saldo_atual + 100
-        c.execute("UPDATE usuarios SET saldo = ? WHERE id_discord = ?", (novo, str(interaction.user.id)))
+        c.execute("UPDATE usuarios SET saldo = %s WHERE id_discord = %s", (novo, str(interaction.user.id)))
         conn.commit()
     finally:
         conn.close()
@@ -938,13 +900,13 @@ async def ranking(interaction: discord.Interaction):
 @app_commands.checks.has_role("Pilantra BOT")
 @app_commands.describe(membro="Usuário que vai receber", valor="Quantidade de Pilas a adicionar")
 async def addsaldo(interaction: discord.Interaction, membro: discord.Member, valor: int):
-    conn = sqlite3.connect('bolao.db', timeout=10)
+    conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT saldo FROM usuarios WHERE id_discord = ?", (str(membro.id),))
+    c.execute("SELECT saldo FROM usuarios WHERE id_discord = %s", (str(membro.id),))
     res = c.fetchone()
     if res:
         novo_saldo = int(res[0]) + valor
-        c.execute("UPDATE usuarios SET saldo = ? WHERE id_discord = ?", (novo_saldo, str(membro.id)))
+        c.execute("UPDATE usuarios SET saldo = %s WHERE id_discord = %s", (novo_saldo, str(membro.id)))
         await interaction.response.send_message(f"🏦 **Administração:** {valor} Pilas injetados na conta de {membro.mention}. Novo saldo: {novo_saldo}")
     else:
         await interaction.response.send_message("❌ Esse usuário não está registrado no bot.")
@@ -956,13 +918,13 @@ async def addsaldo(interaction: discord.Interaction, membro: discord.Member, val
 @app_commands.checks.has_role("Pilantra BOT")
 @app_commands.describe(membro="Usuário que vai perder Pilas", valor="Quantidade de Pilas a remover")
 async def remsaldo(interaction: discord.Interaction, membro: discord.Member, valor: int):
-    conn = sqlite3.connect('bolao.db', timeout=10)
+    conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT saldo FROM usuarios WHERE id_discord = ?", (str(membro.id),))
+    c.execute("SELECT saldo FROM usuarios WHERE id_discord = %s", (str(membro.id),))
     res = c.fetchone()
     if res:
         novo_saldo = int(res[0]) - valor
-        c.execute("UPDATE usuarios SET saldo = ? WHERE id_discord = ?", (novo_saldo, str(membro.id)))
+        c.execute("UPDATE usuarios SET saldo = %s WHERE id_discord = %s", (novo_saldo, str(membro.id)))
         await interaction.response.send_message(f"🏦 **Administração:** {valor} Pilas removidos da conta de {membro.mention}. Novo saldo: {novo_saldo}")
     else:
         await interaction.response.send_message("❌ Esse usuário não está registrado no bot.")
@@ -974,9 +936,9 @@ async def remsaldo(interaction: discord.Interaction, membro: discord.Member, val
 @app_commands.checks.has_role("Pilantra BOT")
 @app_commands.describe(membro="Dono da aposta", jogo="Nome exato do jogo (veja em /apostasdodia)")
 async def remaposta(interaction: discord.Interaction, membro: discord.Member, jogo: str):
-    conn = sqlite3.connect('bolao.db', timeout=10)
+    conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT valor FROM apostas WHERE id_discord = ? AND jogo = ?", (str(membro.id), jogo))
+    c.execute("SELECT valor FROM apostas WHERE id_discord = %s AND jogo = %s", (str(membro.id), jogo))
     apostas_encontradas = c.fetchall()
 
     if not apostas_encontradas:
@@ -984,16 +946,15 @@ async def remaposta(interaction: discord.Interaction, membro: discord.Member, jo
         conn.close()
         return
 
-    # FIX: o valor apostado agora é devolvido ao cancelar (antes ficava perdido).
     total_reembolso = sum(int(v[0]) for v in apostas_encontradas)
 
-    c.execute("SELECT saldo FROM usuarios WHERE id_discord = ?", (str(membro.id),))
+    c.execute("SELECT saldo FROM usuarios WHERE id_discord = %s", (str(membro.id),))
     res = c.fetchone()
     if res:
         novo_saldo = int(res[0]) + total_reembolso
-        c.execute("UPDATE usuarios SET saldo = ? WHERE id_discord = ?", (novo_saldo, str(membro.id)))
+        c.execute("UPDATE usuarios SET saldo = %s WHERE id_discord = %s", (novo_saldo, str(membro.id)))
 
-    c.execute("DELETE FROM apostas WHERE id_discord = ? AND jogo = ?", (str(membro.id), jogo))
+    c.execute("DELETE FROM apostas WHERE id_discord = %s AND jogo = %s", (str(membro.id), jogo))
     conn.commit()
     conn.close()
 
@@ -1005,7 +966,7 @@ async def remaposta(interaction: discord.Interaction, membro: discord.Member, jo
 @bot.tree.command(name="apostasdodia", description="[Admin] Lista todas as apostas ativas no momento")
 @app_commands.checks.has_role("Pilantra BOT")
 async def apostasdodia(interaction: discord.Interaction):
-    conn = sqlite3.connect('bolao.db', timeout=10)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT id_discord, jogo, palpite, valor, odd FROM apostas")
     apostas = c.fetchall()
@@ -1027,8 +988,6 @@ async def apostasdodia(interaction: discord.Interaction):
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    # FIX: erros de slash command agora sempre dão uma resposta pro usuário
-    # (antes, comandos admin com argumento inválido ficavam mudos no Discord).
     if isinstance(error, app_commands.MissingRole) or isinstance(error, app_commands.MissingAnyRole):
         mensagem = "⛔ Só o mais pilantra pode usar este comando!"
     elif isinstance(error, app_commands.CommandOnCooldown):
@@ -1071,8 +1030,6 @@ async def on_ready():
     except Exception as e:
         print(f"[sync] Erro ao sincronizar slash commands: {e}")
 
-    # FIX: reconcilia apostas órfãs e retoma jogos simulados que não foram
-    # resolvidos antes de um restart do bot.
     reconciliar_apostas_orfas()
     await retomar_simulacoes()
 
