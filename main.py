@@ -525,74 +525,6 @@ class ApostaModal(discord.ui.Modal, title="Sua Aposta"):
         await interaction.response.send_message(f"✅ **Aposta Registrada!**\nVocê investiu **{valor_int} Pilas** no **{self.palpite}** (Odd: {self.odd}).\nSaldo restante: {novo_saldo} Pilas.")
 
 
-class CampeaoModal(discord.ui.Modal, title="Palpite de Campeão"):
-    selecao = discord.ui.TextInput(label="Qual seleção será a campeã?", placeholder="Ex: Brasil", required=True)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        conn = get_conn()
-        c = conn.cursor()
-        id_usuario = str(interaction.user.id)
-        try:
-            c.execute("SELECT saldo FROM usuarios WHERE id_discord = %s", (id_usuario,))
-            resultado = c.fetchone()
-            if not resultado:
-                return await interaction.response.send_message("❌ Você não tem conta! Use `/registrar`.", ephemeral=True)
-
-            saldo_atual = int(resultado[0])
-            c.execute("SELECT selecao FROM palpites_campeao WHERE id_discord = %s", (id_usuario,))
-            aposta_existente = c.fetchone()
-
-            if aposta_existente:
-                taxa = 200
-                if saldo_atual < taxa:
-                    return await interaction.response.send_message(f"💸 Cadê o dinheiro? Trocar o palpite custa {taxa} Pilas, e você só tem {saldo_atual}.", ephemeral=True)
-                palpite_antigo = aposta_existente[0]
-                novo_saldo = saldo_atual - taxa
-                c.execute("UPDATE usuarios SET saldo = %s WHERE id_discord = %s", (novo_saldo, id_usuario))
-                c.execute("UPDATE palpites_campeao SET selecao = %s WHERE id_discord = %s", (self.selecao.value, id_usuario))
-                await interaction.response.send_message(f"🔄 {interaction.user.mention} pagou {taxa} Pilas e trocou o palpite de campeão de **{palpite_antigo}** para **{self.selecao.value}**!\nSaldo: {novo_saldo} Pilas.")
-            else:
-                c.execute("INSERT INTO palpites_campeao (id_discord, selecao) VALUES (%s, %s)", (id_usuario, self.selecao.value))
-                await interaction.response.send_message(f"🏆 {interaction.user.mention} cravou que **{self.selecao.value}** será a campeã da Copa!")
-            conn.commit()
-        finally:
-            conn.close()
-
-
-class ArtilheiroModal(discord.ui.Modal, title="Palpite de Artilheiro"):
-    jogador = discord.ui.TextInput(label="Quem será o artilheiro?", placeholder="Ex: Neymar", required=True)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        conn = get_conn()
-        c = conn.cursor()
-        id_usuario = str(interaction.user.id)
-        try:
-            c.execute("SELECT saldo FROM usuarios WHERE id_discord = %s", (id_usuario,))
-            resultado = c.fetchone()
-            if not resultado:
-                return await interaction.response.send_message("❌ Você não tem conta! Use `/registrar`.", ephemeral=True)
-
-            saldo_atual = int(resultado[0])
-            c.execute("SELECT jogador FROM palpites_artilheiro WHERE id_discord = %s", (id_usuario,))
-            aposta_existente = c.fetchone()
-
-            if aposta_existente:
-                taxa = 200
-                if saldo_atual < taxa:
-                    return await interaction.response.send_message(f"💸 Tá quebrado! Trocar o artilheiro custa {taxa} Pilas, e você tem apenas {saldo_atual}.", ephemeral=True)
-                palpite_antigo = aposta_existente[0]
-                novo_saldo = saldo_atual - taxa
-                c.execute("UPDATE usuarios SET saldo = %s WHERE id_discord = %s", (novo_saldo, id_usuario))
-                c.execute("UPDATE palpites_artilheiro SET jogador = %s WHERE id_discord = %s", (self.jogador.value, id_usuario))
-                await interaction.response.send_message(f"🔄 {interaction.user.mention} pagou {taxa} Pilas e trocou o palpite de artilheiro de **{palpite_antigo}** para **{self.jogador.value}**!\nSaldo: {novo_saldo} Pilas.")
-            else:
-                c.execute("INSERT INTO palpites_artilheiro (id_discord, jogador) VALUES (%s, %s)", (id_usuario, self.jogador.value))
-                await interaction.response.send_message(f"👟 {interaction.user.mention} cravou que **{self.jogador.value}** será o artilheiro da Copa!")
-            conn.commit()
-        finally:
-            conn.close()
-
-
 class PixModal(discord.ui.Modal, title="Fazer um PIX"):
     valor = discord.ui.TextInput(label="Quantos Pilas quer transferir?", style=discord.TextStyle.short, placeholder="Ex: 100", required=True)
 
@@ -685,6 +617,74 @@ class JogoView(discord.ui.View):
     def __init__(self, odds):
         super().__init__(timeout=120)
         self.add_item(JogoSelect(odds))
+
+
+def agrupar_jogos_por_dia(odds: dict) -> list:
+    """Agrupa o dicionário de odds por data (dia) e devolve uma lista ordenada
+    de tuplas (data, [(jogo, info), ...]), com os jogos de cada dia ordenados
+    por horário. Usado pela paginação do /jogos."""
+    por_dia = {}
+    for jogo, info in odds.items():
+        dia = info["Horario_DT"].date()
+        por_dia.setdefault(dia, []).append((jogo, info))
+
+    dias_ordenados = sorted(por_dia.keys())
+    resultado = []
+    for dia in dias_ordenados:
+        jogos_do_dia = sorted(por_dia[dia], key=lambda par: par[1]["Horario_DT"])
+        resultado.append((dia, jogos_do_dia))
+    return resultado
+
+
+class JogosPorDiaView(discord.ui.View):
+    """Paginação do /jogos: uma página por dia, com botões ◀ Dia anterior /
+    Próximo dia ▶ embaixo do embed."""
+
+    def __init__(self, paginas: list, autor_id: int, indice_inicial: int = 0):
+        super().__init__(timeout=180)
+        self.paginas = paginas  # lista de (data, [(jogo, info), ...])
+        self.autor_id = autor_id
+        self.indice = indice_inicial
+        self._atualizar_botoes()
+
+    def _atualizar_botoes(self):
+        self.botao_anterior.disabled = (self.indice <= 0)
+        self.botao_proximo.disabled = (self.indice >= len(self.paginas) - 1)
+
+    def construir_embed(self) -> discord.Embed:
+        dia, jogos_do_dia = self.paginas[self.indice]
+        dias_semana = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"]
+        label_dia = f"{dias_semana[dia.weekday()]}, {dia.strftime('%d/%m')}"
+
+        embed = discord.Embed(
+            title=f"⚽ Jogos — {label_dia}",
+            description=f"Página {self.indice + 1} de {len(self.paginas)}",
+            color=discord.Color.green()
+        )
+        for jogo, info in jogos_do_dia:
+            texto = (f"**{info['Vencedor_Casa']}** ({info['Odd_Casa']}) ou "
+                     f"**{info['Vencedor_Fora']}** ({info['Odd_Fora']})\n"
+                     f"⏰ {info['Horario']}")
+            embed.add_field(name=jogo, value=texto, inline=False)
+        return embed
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.autor_id:
+            await interaction.response.send_message("⛔ Só quem usou o comando pode trocar de página.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="◀ Dia anterior", style=discord.ButtonStyle.secondary)
+    async def botao_anterior(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.indice -= 1
+        self._atualizar_botoes()
+        await interaction.response.edit_message(embed=self.construir_embed(), view=self)
+
+    @discord.ui.button(label="Próximo dia ▶", style=discord.ButtonStyle.secondary)
+    async def botao_proximo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.indice += 1
+        self._atualizar_botoes()
+        await interaction.response.edit_message(embed=self.construir_embed(), view=self)
 
 
 class SimplesButtonView(discord.ui.View):
@@ -780,16 +780,6 @@ async def apostar(interaction: discord.Interaction):
     await interaction.response.send_message("👇 **Selecione a partida:**", view=JogoView(odds))
 
 
-@bot.tree.command(name="campeao", description="Registra (ou troca) seu palpite de campeão da Copa")
-async def campeao(interaction: discord.Interaction):
-    await interaction.response.send_message("🏆 Clique para registrar seu Campeão:", view=SimplesButtonView(CampeaoModal, "Palpite Campeão"))
-
-
-@bot.tree.command(name="artilheiro", description="Registra (ou troca) seu palpite de artilheiro da Copa")
-async def artilheiro(interaction: discord.Interaction):
-    await interaction.response.send_message("👟 Clique para registrar o Artilheiro:", view=SimplesButtonView(ArtilheiroModal, "Palpite Artilheiro"))
-
-
 @bot.tree.command(name="pix", description="Transfere Pilas para outro usuário")
 async def pix(interaction: discord.Interaction):
     view = discord.ui.View()
@@ -838,41 +828,43 @@ async def saldo(interaction: discord.Interaction):
         await interaction.response.send_message(f"⚠️ {interaction.user.mention}, você não tem conta! Use `/registrar`.")
 
 
-@bot.tree.command(name="jogos", description="Lista os jogos do dia com as odds")
+@bot.tree.command(name="jogos", description="Lista os jogos separados por dia, com botões para navegar")
 async def jogos(interaction: discord.Interaction):
     await interaction.response.defer()
     odds = await obter_todas_odds()
     if not odds:
-        return await interaction.followup.send("⚽ **Sem jogos hoje!**")
-    embed = discord.Embed(title="⚽ Jogos de Hoje", color=discord.Color.green())
-    for jogo, info in list(odds.items())[:15]:
-        embed.add_field(name=jogo, value=f"**{info['Vencedor_Casa']}** ({info['Odd_Casa']}) ou **{info['Vencedor_Fora']}** ({info['Odd_Fora']})\n⏰ {info['Horario']}", inline=False)
-    await interaction.followup.send(embed=embed)
+        return await interaction.followup.send("⚽ **Sem jogos no momento!**")
+
+    paginas = agrupar_jogos_por_dia(odds)
+
+    # Começa na página do dia de hoje, se existir; senão, na primeira página disponível.
+    hoje = (datetime.utcnow() - timedelta(hours=3)).date()
+    indice_inicial = 0
+    for i, (dia, _) in enumerate(paginas):
+        if dia == hoje:
+            indice_inicial = i
+            break
+
+    view = JogosPorDiaView(paginas, autor_id=interaction.user.id, indice_inicial=indice_inicial)
+    await interaction.followup.send(embed=view.construir_embed(), view=view)
 
 
-@bot.tree.command(name="palpites", description="Mostra seus palpites e apostas registradas")
+@bot.tree.command(name="palpites", description="Mostra suas apostas registradas")
 async def palpites(interaction: discord.Interaction):
     conn = get_conn()
     c = conn.cursor()
     id_us = str(interaction.user.id)
-    c.execute("SELECT selecao FROM palpites_campeao WHERE id_discord = %s", (id_us,))
-    camp = c.fetchone()
-    c.execute("SELECT jogador FROM palpites_artilheiro WHERE id_discord = %s", (id_us,))
-    art = c.fetchone()
     c.execute("SELECT jogo, palpite, valor, odd FROM apostas WHERE id_discord = %s", (id_us,))
     apostas = c.fetchall()
     conn.close()
 
     embed = discord.Embed(title=f"🧾 Bilhete de {interaction.user.display_name}", color=discord.Color.gold())
-    embed.add_field(name="🏆 Campeão", value=f"**{camp[0]}**" if camp else "Vazio", inline=True)
-    embed.add_field(name="👟 Artilheiro", value=f"**{art[0]}**" if art else "Vazio", inline=True)
-    embed.add_field(name="\u200b", value="\u200b", inline=False)
 
     if apostas:
         txt = "".join([f"⚽ **{a[0]}**\n↳ Palpite: **{a[1]}** | 💸 {int(a[2])} Pilas (Odd: {a[3]})\n\n" for a in apostas])
-        embed.add_field(name="📅 Jogos do Dia", value=txt, inline=False)
+        embed.add_field(name="📅 Apostas Ativas", value=txt, inline=False)
     else:
-        embed.add_field(name="📅 Jogos do Dia", value="Nenhuma aposta ativa hoje.", inline=False)
+        embed.add_field(name="📅 Apostas Ativas", value="Nenhuma aposta ativa hoje.", inline=False)
     await interaction.response.send_message(embed=embed)
 
 
@@ -942,8 +934,6 @@ async def comandos(interaction: discord.Interaction):
     embed.add_field(name="/jogos", value="Lista os jogos do dia com odds.", inline=False)
     embed.add_field(name="/apostar", value="Abre o menu interativo para apostar nos jogos do dia.", inline=False)
     embed.add_field(name="/palpites", value="Mostra seus palpites e apostas registradas.", inline=False)
-    embed.add_field(name="/campeao", value="Registra seu palpite de campeão da Copa.", inline=False)
-    embed.add_field(name="/artilheiro", value="Registra seu palpite de artilheiro da Copa.", inline=False)
     embed.add_field(name="/salario", value="Resgata 350 Pilas de salário diário (a cada 72h).", inline=False)
     embed.add_field(name="/pix", value="Transfere Pilas para outro usuário.", inline=False)
     embed.add_field(name="/mendigar", value="Solicita 100 Pilas de graça (a cada 24h).", inline=False)
