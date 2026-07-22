@@ -30,20 +30,73 @@ init_db()
 # Integração com a The Odds API
 # ---------------------------------------------------------------------------
 
+# FIX: o Brasileirão não tem cobertura consistente entre os bookmakers da
+# região "eu" (europeus). Tentamos várias regiões em ordem até encontrar
+# alguma com odds — respostas totalmente vazias não consomem quota extra,
+# então esse fallback não sai caro na maioria dos casos.
+REGIOES_TENTATIVAS = ["eu", "uk", "us"]
+
+
 def buscar_odds_do_dia():
     API_KEY = os.environ.get('ODDS_API_KEY')
     if not API_KEY:
         return None, "⚠️ A variável `ODDS_API_KEY` não foi encontrada no Render!"
 
-    url = f"https://api.the-odds-api.com/v4/sports/soccer_brazil_campeonato/odds/?apiKey={API_KEY}&regions=eu&markets=h2h"
-    try:
-        resposta = requests.get(url)
+    dados = None
+    regiao_usada = None
+    houve_sucesso_http = False  # pelo menos uma região respondeu 200, mesmo que vazia
+
+    for regiao in REGIOES_TENTATIVAS:
+        url = f"https://api.the-odds-api.com/v4/sports/soccer_brazil_campeonato/odds/?apiKey={API_KEY}&regions={regiao}&markets=h2h"
+        try:
+            resposta = requests.get(url)
+        except Exception as e:
+            print(f"[buscar_odds_do_dia] Falha de rede na região '{regiao}': {e}")
+            continue
+
+        restantes = resposta.headers.get('x-requests-remaining')
+        print(f"[buscar_odds_do_dia] região={regiao} status={resposta.status_code} "
+              f"requests-restantes={restantes}")
+
         if resposta.status_code != 200:
-            return None, "⚠️ Erro na API."
+            print(f"[buscar_odds_do_dia] Erro na API (região '{regiao}'): {resposta.text[:300]}")
+            continue
 
-        dados = resposta.json()
+        houve_sucesso_http = True
+        candidato = resposta.json()
+        # FIX: log de diagnóstico -- mostra quantos jogos vieram e quantos
+        # já têm pelo menos 1 bookmaker com odds, pra facilitar depuração
+        # via logs do Render sem precisar adivinhar.
+        n_jogos = len(candidato)
+        n_com_odds = sum(1 for j in candidato if j.get("bookmakers"))
+        print(f"[buscar_odds_do_dia] região={regiao}: {n_jogos} jogo(s) retornado(s), "
+              f"{n_com_odds} com odds disponíveis.")
+
+        if n_com_odds > 0:
+            dados = candidato
+            regiao_usada = regiao
+            break
+        elif dados is None and n_jogos > 0:
+            # guarda como fallback: pelo menos tem os jogos (mesmo sem odds),
+            # melhor que nada caso nenhuma região tenha bookmaker cobrindo
+            dados = candidato
+            regiao_usada = regiao
+
+    if dados is None:
+        if houve_sucesso_http:
+            # FIX: nenhuma região tem jogo nenhum listado (não é erro de rede/API,
+            # é legitimamente "sem rodada agora" — ex.: fora de temporada ou
+            # intervalo entre rodadas). Trata como sucesso com lista vazia,
+            # igual o comportamento original, em vez de mostrar erro ao usuário.
+            print("[buscar_odds_do_dia] Nenhuma região retornou jogos — sem rodada no momento.")
+            return {}, "Sucesso"
+        return None, ("⚠️ Nenhuma região respondeu com sucesso à API. "
+                       "Confira os logs do Render para mais detalhes.")
+
+    print(f"[buscar_odds_do_dia] Usando dados da região '{regiao_usada}'.")
+
+    try:
         odds_do_dia = {}
-
         conn = get_conn()
         c = conn.cursor()
 
@@ -84,8 +137,14 @@ def buscar_odds_do_dia():
 
         conn.commit()
         conn.close()
+
+        if not odds_do_dia:
+            print(f"[buscar_odds_do_dia] {len(dados)} jogo(s) na resposta, mas nenhum tinha "
+                  f"bookmaker com mercado h2h aberto ainda (comum entre rodadas ou dias antes do jogo).")
+
         return odds_do_dia, "Sucesso"
     except Exception as e:
+        print(f"[buscar_odds_do_dia] Exceção ao processar resposta: {e}")
         return None, str(e)
 
 
@@ -99,6 +158,8 @@ def buscar_resultados_api():
         resposta = requests.get(url)
         if resposta.status_code == 200:
             return resposta.json()
+        else:
+            print(f"[buscar_resultados_api] status={resposta.status_code} body={resposta.text[:300]}")
     except Exception as e:
         print(f"[buscar_resultados_api] Erro ao buscar resultados: {e}")
     return None
@@ -980,6 +1041,35 @@ async def apostasdodia(interaction: discord.Interaction):
         id_discord, jogo, palpite, valor, odd = aposta
         embed.add_field(name=jogo, value=f"<@{id_discord}> apostou em **{palpite}** | 💸 {int(valor)} Pilas (Odd: {odd})", inline=False)
     await interaction.response.send_message(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# Comando de diagnóstico
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="debugodds", description="[Admin] Mostra o status bruto da API de odds para diagnóstico")
+@app_commands.checks.has_role("Pilantra BOT")
+async def debugodds(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    API_KEY = os.environ.get('ODDS_API_KEY')
+    if not API_KEY:
+        return await interaction.followup.send("⚠️ ODDS_API_KEY não configurada.", ephemeral=True)
+
+    linhas = []
+    for regiao in REGIOES_TENTATIVAS:
+        url = f"https://api.the-odds-api.com/v4/sports/soccer_brazil_campeonato/odds/?apiKey={API_KEY}&regions={regiao}&markets=h2h"
+        resposta = await asyncio.to_thread(requests.get, url)
+        restantes = resposta.headers.get('x-requests-remaining', '?')
+        if resposta.status_code == 200:
+            dados = resposta.json()
+            n_jogos = len(dados)
+            n_com_odds = sum(1 for j in dados if j.get("bookmakers"))
+            linhas.append(f"**{regiao}**: {n_jogos} jogo(s), {n_com_odds} com odds | quota restante: {restantes}")
+        else:
+            linhas.append(f"**{regiao}**: erro HTTP {resposta.status_code} | quota restante: {restantes}")
+
+    embed = discord.Embed(title="🔧 Diagnóstico - The Odds API (Brasileirão)", description="\n".join(linhas), color=discord.Color.orange())
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
