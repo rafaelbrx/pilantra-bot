@@ -35,7 +35,7 @@ def buscar_odds_do_dia():
     if not API_KEY:
         return None, "⚠️ A variável `ODDS_API_KEY` não foi encontrada no Render!"
 
-    url = f"https://api.the-odds-api.com/v4/sports/soccer_fifa_world_cup/odds/?apiKey={API_KEY}&regions=eu&markets=h2h"
+    url = f"https://api.the-odds-api.com/v4/sports/soccer_brazil_campeonato/odds/?apiKey={API_KEY}&regions=eu&markets=h2h"
     try:
         resposta = requests.get(url)
         if resposta.status_code != 200:
@@ -94,7 +94,7 @@ def buscar_resultados_api():
     if not API_KEY:
         return None
 
-    url = f"https://api.the-odds-api.com/v4/sports/soccer_fifa_world_cup/scores/?apiKey={API_KEY}&daysFrom=1"
+    url = f"https://api.the-odds-api.com/v4/sports/soccer_brazil_campeonato/scores/?apiKey={API_KEY}&daysFrom=1"
     try:
         resposta = requests.get(url)
         if resposta.status_code == 200:
