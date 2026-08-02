@@ -399,8 +399,46 @@ async def processar_resultado_interno(channel, jogo: str, vencedor: str):
     conn.close()
 
 
+import unicodedata
+
+
+def normalizar_nome_jogo(texto: str) -> str:
+    """Normaliza nomes de jogo/time para comparação tolerante a acentos,
+    caixa alta/baixa e espaços extras -- ex.: 'São Paulo' casa com 'Sao Paulo '.
+    Usado para casar o nome do jogo vindo do endpoint /scores com o nome
+    salvo no banco (vindo do endpoint /odds), que às vezes vêm escritos
+    de forma levemente diferente."""
+    sem_acento = unicodedata.normalize('NFKD', texto).encode('ASCII', 'ignore').decode('ASCII')
+    return " ".join(sem_acento.casefold().split())
+
+
 @tasks.loop(minutes=5)
 async def verificar_resultados_loop():
+    # FIX: toda a função agora roda dentro de um try/except. O decorator
+    # @tasks.loop do discord.py PARA DE RODAR PARA SEMPRE se uma exceção não
+    # tratada escapar do corpo da função -- sem aviso nenhum no Discord, só
+    # nos logs. Isso explica o padrão relatado: com vários jogos simultâneos,
+    # bastava UM deles ter um dado inesperado (placar nulo, jogo adiado, nome
+    # de time com grafia diferente entre /odds e /scores) para o loop inteiro
+    # travar e nenhuma aposta nunca mais ser resolvida, nem dos outros jogos.
+    try:
+        await _verificar_resultados_loop_corpo()
+    except Exception as e:
+        print(f"[verificar_resultados_loop] Erro inesperado no ciclo (loop CONTINUA rodando): {e}")
+
+
+@verificar_resultados_loop.error
+async def verificar_resultados_loop_error(error):
+    # Rede de segurança extra: se mesmo assim uma exceção escapar (ex.: erro
+    # dentro do próprio decorator/scheduler), reinicia o loop em vez de
+    # deixá-lo morto até o próximo redeploy.
+    print(f"[verificar_resultados_loop] Task crashou de forma inesperada: {error}")
+    if not verificar_resultados_loop.is_running():
+        print("[verificar_resultados_loop] Reiniciando a task automaticamente...")
+        verificar_resultados_loop.restart()
+
+
+async def _verificar_resultados_loop_corpo():
     conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT DISTINCT jogo FROM apostas")
@@ -437,35 +475,59 @@ async def verificar_resultados_loop():
     if not dados:
         return
 
+    # FIX: lookup tolerante a acentos/caixa/espaços -- casa "Sao Paulo x ..."
+    # (scores) com "São Paulo x ..." (salvo no banco a partir do /odds) mesmo
+    # que a grafia exata não bata 100%.
+    jogos_pendentes_norm = {normalizar_nome_jogo(j): j for j in jogos_pendentes}
+
     for jogo in dados:
-        if jogo.get('completed'):
+        # FIX: cada jogo é processado dentro do seu próprio try/except. Se um
+        # jogo tiver dado incompleto/inesperado (placar nulo, time cancelado
+        # etc.), só ELE fica pendente pro próximo ciclo -- os demais jogos
+        # completados no mesmo lote continuam sendo pagos normalmente.
+        try:
+            if not jogo.get('completed'):
+                continue
+
             t_casa = jogo.get('home_team')
             t_fora = jogo.get('away_team')
-            jogo_id = f"{t_casa} x {t_fora}"
+            jogo_id_api = f"{t_casa} x {t_fora}"
+            jogo_id_real = jogos_pendentes_norm.get(normalizar_nome_jogo(jogo_id_api))
 
-            if jogo_id in jogos_pendentes:
-                scores = jogo.get('scores')
-                if scores:
-                    score_casa = score_fora = 0
-                    for s in scores:
-                        if s['name'] == t_casa:
-                            score_casa = int(s['score'])
-                        elif s['name'] == t_fora:
-                            score_fora = int(s['score'])
+            if not jogo_id_real:
+                continue  # não é um jogo que alguém apostou
 
-                    if score_casa > score_fora:
-                        vencedor = t_casa
-                    elif score_fora > score_casa:
-                        vencedor = t_fora
-                    else:
-                        vencedor = "Empate"
+            scores = jogo.get('scores')
+            if not scores:
+                print(f"[verificar_resultados_loop] '{jogo_id_real}' está completed=True mas sem "
+                      f"placar (jogo adiado/cancelado?). Deixando pendente para o próximo ciclo.")
+                continue
 
-                    channel = bot.get_channel(CANAL_RESULTADOS_ID)
-                    if channel:
-                        await channel.send(f"🚨 **O JOGO ACABOU!**\n⚽ Placar Final: **{t_casa} {score_casa} x {score_fora} {t_fora}**\nProcessando os pagamentos do bot...")
-                        await processar_resultado_interno(channel, jogo_id, vencedor)
-                    else:
-                        print(f"[verificar_resultados_loop] Canal de resultados ({CANAL_RESULTADOS_ID}) não encontrado — não consegui anunciar '{jogo_id}'.")
+            score_casa = score_fora = 0
+            for s in scores:
+                if s['name'] == t_casa:
+                    score_casa = int(s['score'])
+                elif s['name'] == t_fora:
+                    score_fora = int(s['score'])
+
+            if score_casa > score_fora:
+                vencedor = t_casa
+            elif score_fora > score_casa:
+                vencedor = t_fora
+            else:
+                vencedor = "Empate"
+
+            channel = bot.get_channel(CANAL_RESULTADOS_ID)
+            if channel:
+                await channel.send(f"🚨 **O JOGO ACABOU!**\n⚽ Placar Final: **{t_casa} {score_casa} x {score_fora} {t_fora}**\nProcessando os pagamentos do bot...")
+                await processar_resultado_interno(channel, jogo_id_real, vencedor)
+            else:
+                print(f"[verificar_resultados_loop] Canal de resultados ({CANAL_RESULTADOS_ID}) não encontrado — não consegui anunciar '{jogo_id_real}'.")
+
+        except Exception as e:
+            print(f"[verificar_resultados_loop] Erro ao processar '{jogo.get('home_team')} x {jogo.get('away_team')}': {e}. "
+                  f"Esse jogo específico fica pendente para o próximo ciclo; os demais não são afetados.")
+            continue
 
 
 @tasks.loop(hours=24)
