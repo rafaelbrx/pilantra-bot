@@ -169,6 +169,17 @@ async def obter_todas_odds():
     odds, _ = await asyncio.to_thread(buscar_odds_do_dia)
     if odds is None:
         odds = {}
+
+    # FIX: restringe a apenas os jogos de HOJE. Isso evita que o menu de
+    # apostas (/apostar) fique sujeito ao limite de 25 opções do Discord
+    # somando jogos de vários dias -- com uma rodada completa do Brasileirão
+    # (~10 jogos/dia), sobrar só os jogos de hoje garante que nenhum jogo
+    # desapareça silenciosamente do menu.
+    hoje = (datetime.utcnow() - timedelta(hours=3)).date()
+    odds = {jogo: info for jogo, info in odds.items() if info["Horario_DT"].date() == hoje}
+
+    # jogos simulados (cassino) não são filtrados por data -- são eventos
+    # de curta duração criados sob demanda, resolvidos pelo próprio timer.
     odds.update(jogos_simulados)
     return odds
 
@@ -681,74 +692,6 @@ class JogoView(discord.ui.View):
         self.add_item(JogoSelect(odds))
 
 
-def agrupar_jogos_por_dia(odds: dict) -> list:
-    """Agrupa o dicionário de odds por data (dia) e devolve uma lista ordenada
-    de tuplas (data, [(jogo, info), ...]), com os jogos de cada dia ordenados
-    por horário. Usado pela paginação do /jogos."""
-    por_dia = {}
-    for jogo, info in odds.items():
-        dia = info["Horario_DT"].date()
-        por_dia.setdefault(dia, []).append((jogo, info))
-
-    dias_ordenados = sorted(por_dia.keys())
-    resultado = []
-    for dia in dias_ordenados:
-        jogos_do_dia = sorted(por_dia[dia], key=lambda par: par[1]["Horario_DT"])
-        resultado.append((dia, jogos_do_dia))
-    return resultado
-
-
-class JogosPorDiaView(discord.ui.View):
-    """Paginação do /jogos: uma página por dia, com botões ◀ Dia anterior /
-    Próximo dia ▶ embaixo do embed."""
-
-    def __init__(self, paginas: list, autor_id: int, indice_inicial: int = 0):
-        super().__init__(timeout=180)
-        self.paginas = paginas  # lista de (data, [(jogo, info), ...])
-        self.autor_id = autor_id
-        self.indice = indice_inicial
-        self._atualizar_botoes()
-
-    def _atualizar_botoes(self):
-        self.botao_anterior.disabled = (self.indice <= 0)
-        self.botao_proximo.disabled = (self.indice >= len(self.paginas) - 1)
-
-    def construir_embed(self) -> discord.Embed:
-        dia, jogos_do_dia = self.paginas[self.indice]
-        dias_semana = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"]
-        label_dia = f"{dias_semana[dia.weekday()]}, {dia.strftime('%d/%m')}"
-
-        embed = discord.Embed(
-            title=f"⚽ Jogos — {label_dia}",
-            description=f"Página {self.indice + 1} de {len(self.paginas)}",
-            color=discord.Color.green()
-        )
-        for jogo, info in jogos_do_dia:
-            texto = (f"**{info['Vencedor_Casa']}** ({info['Odd_Casa']}) ou "
-                     f"**{info['Vencedor_Fora']}** ({info['Odd_Fora']})\n"
-                     f"⏰ {info['Horario']}")
-            embed.add_field(name=jogo, value=texto, inline=False)
-        return embed
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.autor_id:
-            await interaction.response.send_message("⛔ Só quem usou o comando pode trocar de página.", ephemeral=True)
-            return False
-        return True
-
-    @discord.ui.button(label="◀ Dia anterior", style=discord.ButtonStyle.secondary)
-    async def botao_anterior(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.indice -= 1
-        self._atualizar_botoes()
-        await interaction.response.edit_message(embed=self.construir_embed(), view=self)
-
-    @discord.ui.button(label="Próximo dia ▶", style=discord.ButtonStyle.secondary)
-    async def botao_proximo(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.indice += 1
-        self._atualizar_botoes()
-        await interaction.response.edit_message(embed=self.construir_embed(), view=self)
-
-
 class SimplesButtonView(discord.ui.View):
     def __init__(self, modal_class, label="Abrir Formulário"):
         super().__init__(timeout=60)
@@ -890,25 +833,21 @@ async def saldo(interaction: discord.Interaction):
         await interaction.response.send_message(f"⚠️ {interaction.user.mention}, você não tem conta! Use `/registrar`.")
 
 
-@bot.tree.command(name="jogos", description="Lista os jogos separados por dia, com botões para navegar")
+@bot.tree.command(name="jogos", description="Lista os jogos de hoje com as odds")
 async def jogos(interaction: discord.Interaction):
     await interaction.response.defer()
     odds = await obter_todas_odds()
     if not odds:
-        return await interaction.followup.send("⚽ **Sem jogos no momento!**")
+        return await interaction.followup.send("⚽ **Sem jogos hoje!**")
 
-    paginas = agrupar_jogos_por_dia(odds)
+    embed = discord.Embed(title="⚽ Jogos de Hoje", color=discord.Color.green())
+    for jogo, info in odds.items():
+        texto = (f"**{info['Vencedor_Casa']}** ({info['Odd_Casa']}) ou "
+                 f"**{info['Vencedor_Fora']}** ({info['Odd_Fora']})\n"
+                 f"⏰ {info['Horario']}")
+        embed.add_field(name=jogo, value=texto, inline=False)
 
-    # Começa na página do dia de hoje, se existir; senão, na primeira página disponível.
-    hoje = (datetime.utcnow() - timedelta(hours=3)).date()
-    indice_inicial = 0
-    for i, (dia, _) in enumerate(paginas):
-        if dia == hoje:
-            indice_inicial = i
-            break
-
-    view = JogosPorDiaView(paginas, autor_id=interaction.user.id, indice_inicial=indice_inicial)
-    await interaction.followup.send(embed=view.construir_embed(), view=view)
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="palpites", description="Mostra suas apostas registradas")
@@ -1124,6 +1063,56 @@ async def debugodds(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
+@bot.tree.command(name="statusresultados", description="[Admin] Mostra se o loop de resultados está rodando e o que falta pra cada aposta pendente")
+@app_commands.checks.has_role("Pilantra BOT")
+async def statusresultados(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    rodando = verificar_resultados_loop.is_running()
+    proxima_execucao = verificar_resultados_loop.next_iteration
+    falhas_seguidas = verificar_resultados_loop.failed()
+
+    linhas = [
+        f"**Loop rodando?** {'✅ Sim' if rodando else '❌ NÃO -- esse é o bug! Reinicie o bot no Render.'}",
+        f"**Falhou na última execução?** {'⚠️ Sim' if falhas_seguidas else 'Não'}",
+        f"**Próxima verificação:** {proxima_execucao.strftime('%d/%m %H:%M:%S UTC') if proxima_execucao else 'N/A'}",
+        "",
+    ]
+
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT DISTINCT jogo FROM apostas")
+    jogos_pendentes = [r[0] for r in c.fetchall()]
+
+    if not jogos_pendentes:
+        linhas.append("📭 Nenhuma aposta pendente no momento.")
+    else:
+        agora_brasil = datetime.utcnow() - timedelta(hours=3)
+        linhas.append(f"**Apostas pendentes ({len(jogos_pendentes)} jogo(s)):**")
+        for jogo in jogos_pendentes:
+            if jogo in jogos_simulados:
+                linhas.append(f"🎰 {jogo} — evento simulado (resolve pelo próprio timer, não pela API)")
+                continue
+
+            c.execute("SELECT horario_dt FROM horarios_jogos WHERE jogo = %s", (jogo,))
+            res = c.fetchone()
+            if not res:
+                linhas.append(f"⚠️ {jogo} — SEM horário registrado em `horarios_jogos` "
+                               f"(a API nunca chega a ser consultada pra esse jogo!)")
+                continue
+
+            horario_dt = datetime.fromisoformat(res[0])
+            minutos_passados = (agora_brasil - horario_dt).total_seconds() / 60
+            gate_liberado = minutos_passados >= 105
+            status = "✅ liberado pra consultar API" if gate_liberado else f"⏳ faltam {105 - int(minutos_passados)} min pro gate de 105min"
+            linhas.append(f"⚽ {jogo} — kickoff há {int(minutos_passados)} min — {status}")
+
+    conn.close()
+
+    embed = discord.Embed(title="🔧 Diagnóstico - Loop de Resultados", description="\n".join(linhas), color=discord.Color.orange())
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
 # ---------------------------------------------------------------------------
 # Tratamento de erros dos slash commands
 # ---------------------------------------------------------------------------
@@ -1172,13 +1161,33 @@ async def on_ready():
     except Exception as e:
         print(f"[sync] Erro ao sincronizar slash commands: {e}")
 
-    reconciliar_apostas_orfas()
-    await retomar_simulacoes()
+    # FIX: essa era a causa raiz mais provável do bug. reconciliar_apostas_orfas()
+    # e retomar_simulacoes() não tinham try/except -- se qualquer uma delas
+    # lançasse uma exceção (erro de banco, canal inacessível, dado corrompido),
+    # o on_ready() parava ali mesmo e as duas linhas que INICIAM o loop de
+    # verificação de resultados (mais embaixo) nunca eram executadas. O bot
+    # ficava "online" normalmente, mas o loop que paga as apostas nunca começava
+    # a rodar. Agora cada etapa é isolada, então uma falha numa não impede as
+    # outras nem impede o início dos loops.
+    try:
+        reconciliar_apostas_orfas()
+    except Exception as e:
+        print(f"[on_ready] Erro ao reconciliar apostas órfãs (não impede o resto do startup): {e}")
+
+    try:
+        await retomar_simulacoes()
+    except Exception as e:
+        print(f"[on_ready] Erro ao retomar simulações (não impede o resto do startup): {e}")
 
     if not verificar_resultados_loop.is_running():
         verificar_resultados_loop.start()
+        print("[on_ready] verificar_resultados_loop INICIADO.")
+    else:
+        print("[on_ready] verificar_resultados_loop já estava rodando.")
+
     if not enviar_ranking_diario.is_running():
         enviar_ranking_diario.start()
+        print("[on_ready] enviar_ranking_diario INICIADO.")
 
 
 keep_alive()
