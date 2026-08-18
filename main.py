@@ -165,10 +165,18 @@ def buscar_resultados_api():
     return None
 
 
-async def obter_todas_odds():
+async def obter_todas_odds(apenas_hoje: bool = True):
     odds, _ = await asyncio.to_thread(buscar_odds_do_dia)
     if odds is None:
         odds = {}
+
+    # jogos simulados (cassino) entram sempre, independente do filtro de data --
+    # são eventos de curta duração criados sob demanda, resolvidos pelo próprio timer.
+    odds = dict(odds)
+    odds.update(jogos_simulados)
+
+    if not apenas_hoje:
+        return odds
 
     # FIX: restringe a apenas os jogos de HOJE. Isso evita que o menu de
     # apostas (/apostar) fique sujeito ao limite de 25 opções do Discord
@@ -177,11 +185,26 @@ async def obter_todas_odds():
     # desapareça silenciosamente do menu.
     hoje = (datetime.utcnow() - timedelta(hours=3)).date()
     odds = {jogo: info for jogo, info in odds.items() if info["Horario_DT"].date() == hoje}
-
-    # jogos simulados (cassino) não são filtrados por data -- são eventos
-    # de curta duração criados sob demanda, resolvidos pelo próprio timer.
-    odds.update(jogos_simulados)
     return odds
+
+
+DIAS_SEMANA_PT = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"]
+
+
+def formatar_data_extenso(data) -> str:
+    return f"{DIAS_SEMANA_PT[data.weekday()]}, {data.strftime('%d/%m')}"
+
+
+def encontrar_proxima_data_com_jogo(odds_completas: dict, hoje):
+    """Dado o dicionário de odds SEM filtro de data (apenas_hoje=False), acha
+    a data mais próxima, no futuro, que tenha algum jogo. Usado para avisar
+    o usuário quando não há jogos hoje."""
+    datas_futuras = sorted({
+        info["Horario_DT"].date()
+        for info in odds_completas.values()
+        if info["Horario_DT"].date() > hoje
+    })
+    return datas_futuras[0] if datas_futuras else None
 
 
 def gerar_embed_ranking():
@@ -781,6 +804,12 @@ class ResultadoModal(discord.ui.Modal, title="Processar Resultado Oficial"):
 async def apostar(interaction: discord.Interaction):
     odds = await obter_todas_odds()
     if not odds:
+        odds_completas = await obter_todas_odds(apenas_hoje=False)
+        hoje = (datetime.utcnow() - timedelta(hours=3)).date()
+        proxima_data = encontrar_proxima_data_com_jogo(odds_completas, hoje)
+        if proxima_data:
+            return await interaction.response.send_message(
+                f"❌ Não há jogos hoje. O próximo jogo é em **{formatar_data_extenso(proxima_data)}**.")
         return await interaction.response.send_message("❌ Não há jogos abertos no momento.")
     await interaction.response.send_message("👇 **Selecione a partida:**", view=JogoView(odds))
 
@@ -838,6 +867,12 @@ async def jogos(interaction: discord.Interaction):
     await interaction.response.defer()
     odds = await obter_todas_odds()
     if not odds:
+        odds_completas = await obter_todas_odds(apenas_hoje=False)
+        hoje = (datetime.utcnow() - timedelta(hours=3)).date()
+        proxima_data = encontrar_proxima_data_com_jogo(odds_completas, hoje)
+        if proxima_data:
+            return await interaction.followup.send(
+                f"⚽ **Sem jogos hoje!** O próximo jogo é em **{formatar_data_extenso(proxima_data)}**.")
         return await interaction.followup.send("⚽ **Sem jogos hoje!**")
 
     embed = discord.Embed(title="⚽ Jogos de Hoje", color=discord.Color.green())
