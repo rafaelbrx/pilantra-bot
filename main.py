@@ -40,6 +40,10 @@ REGIOES_TENTATIVAS = ["eu", "uk", "us"]
 def buscar_odds_do_dia():
     API_KEY = os.environ.get('ODDS_API_KEY')
     if not API_KEY:
+        # FIX: esse caso retornava sem nenhum log -- se a env var estivesse
+        # ausente/errada no Render, não sobraria nenhuma pista no log de por
+        # que os jogos não aparecem. Agora fica registrado explicitamente.
+        print("[buscar_odds_do_dia] ODDS_API_KEY não encontrada nas variáveis de ambiente do Render.")
         return None, "⚠️ A variável `ODDS_API_KEY` não foi encontrada no Render!"
 
     dados = None
@@ -49,7 +53,13 @@ def buscar_odds_do_dia():
     for regiao in REGIOES_TENTATIVAS:
         url = f"https://api.the-odds-api.com/v4/sports/soccer_brazil_campeonato/odds/?apiKey={API_KEY}&regions={regiao}&markets=h2h"
         try:
-            resposta = requests.get(url)
+            # FIX: requests.get sem timeout espera INDEFINIDAMENTE se a API ou
+            # a rede travar -- é isso que fazia o /jogos ficar "pensando" pra
+            # sempre. Com timeout, uma trava vira um erro tratável em até 10s.
+            resposta = requests.get(url, timeout=10)
+        except requests.exceptions.Timeout:
+            print(f"[buscar_odds_do_dia] Timeout (10s) na região '{regiao}' -- pulando para a próxima.")
+            continue
         except Exception as e:
             print(f"[buscar_odds_do_dia] Falha de rede na região '{regiao}': {e}")
             continue
@@ -155,7 +165,7 @@ def buscar_resultados_api():
 
     url = f"https://api.the-odds-api.com/v4/sports/soccer_brazil_campeonato/scores/?apiKey={API_KEY}&daysFrom=1"
     try:
-        resposta = requests.get(url)
+        resposta = requests.get(url, timeout=10)
         if resposta.status_code == 200:
             return resposta.json()
         else:
@@ -166,7 +176,12 @@ def buscar_resultados_api():
 
 
 async def obter_todas_odds(apenas_hoje: bool = True):
-    odds, _ = await asyncio.to_thread(buscar_odds_do_dia)
+    odds, erro = await asyncio.to_thread(buscar_odds_do_dia)
+    # FIX: antes, qualquer falha real (chave de API ausente, todas as regiões
+    # falhando, etc.) virava silenciosamente um dict vazio -- e /jogos mostrava
+    # "Sem jogos hoje!" mesmo quando o problema era outro. Agora o motivo do
+    # erro é propagado junto, para o comando poder mostrar a causa real.
+    erro_real = erro if odds is None else None
     if odds is None:
         odds = {}
 
@@ -176,7 +191,7 @@ async def obter_todas_odds(apenas_hoje: bool = True):
     odds.update(jogos_simulados)
 
     if not apenas_hoje:
-        return odds
+        return odds, erro_real
 
     # FIX: restringe a apenas os jogos de HOJE. Isso evita que o menu de
     # apostas (/apostar) fique sujeito ao limite de 25 opções do Discord
@@ -185,7 +200,29 @@ async def obter_todas_odds(apenas_hoje: bool = True):
     # desapareça silenciosamente do menu.
     hoje = (datetime.utcnow() - timedelta(hours=3)).date()
     odds = {jogo: info for jogo, info in odds.items() if info["Horario_DT"].date() == hoje}
-    return odds
+    return odds, erro_real
+
+
+async def obter_todas_odds_com_timeout(apenas_hoje: bool = True, segundos: int = 25):
+    """Rede de segurança final: mesmo com timeout em cada chamada de rede
+    individual (API de odds e Postgres), um travamento inesperado em
+    qualquer outro ponto não deveria fazer o comando 'pensar' pra sempre.
+    Isso garante uma resposta (de erro, se preciso) em no máximo `segundos`."""
+    try:
+        return await asyncio.wait_for(obter_todas_odds(apenas_hoje=apenas_hoje), timeout=segundos)
+    except asyncio.TimeoutError:
+        msg = f"Timeout: a busca demorou mais de {segundos}s"
+        print(f"[obter_todas_odds_com_timeout] {msg} -- abortando.")
+        return {}, msg
+
+
+def filtrar_odds_por_hoje(odds_completas: dict, hoje) -> dict:
+    """Filtra localmente (sem nova chamada de rede) um dicionário de odds já
+    obtido, mantendo só os jogos de hoje + qualquer jogo simulado."""
+    return {
+        jogo: info for jogo, info in odds_completas.items()
+        if info["Horario_DT"].date() == hoje or jogo in jogos_simulados
+    }
 
 
 DIAS_SEMANA_PT = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"]
@@ -802,16 +839,29 @@ class ResultadoModal(discord.ui.Modal, title="Processar Resultado Oficial"):
 
 @bot.tree.command(name="apostar", description="Abre o menu para apostar nos jogos do dia")
 async def apostar(interaction: discord.Interaction):
-    odds = await obter_todas_odds()
+    await interaction.response.defer()
+
+    # FIX: antes chamava obter_todas_odds() até 2x (uma filtrada, outra sem
+    # filtro) -- cada chamada dispara até 3 requisições HTTP (fallback de
+    # região), ou seja, até 6 chamadas de rede sequenciais num único comando.
+    # Agora busca uma vez só e filtra localmente em memória.
+    odds_completas, erro = await obter_todas_odds_com_timeout(apenas_hoje=False)
+    hoje = (datetime.utcnow() - timedelta(hours=3)).date()
+    odds = filtrar_odds_por_hoje(odds_completas, hoje)
+
     if not odds:
-        odds_completas = await obter_todas_odds(apenas_hoje=False)
-        hoje = (datetime.utcnow() - timedelta(hours=3)).date()
+        if erro:
+            # FIX: mostra o motivo REAL (chave de API ausente, todas as
+            # regiões falharam, etc.) em vez de deixar parecer que
+            # simplesmente não há jogo -- isso estava mascarando erros de
+            # configuração como se fosse "sem jogos hoje".
+            return await interaction.followup.send(f"⚠️ Não consegui buscar os jogos: {erro}")
         proxima_data = encontrar_proxima_data_com_jogo(odds_completas, hoje)
         if proxima_data:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 f"❌ Não há jogos hoje. O próximo jogo é em **{formatar_data_extenso(proxima_data)}**.")
-        return await interaction.response.send_message("❌ Não há jogos abertos no momento.")
-    await interaction.response.send_message("👇 **Selecione a partida:**", view=JogoView(odds))
+        return await interaction.followup.send("❌ Não há jogos abertos no momento.")
+    await interaction.followup.send("👇 **Selecione a partida:**", view=JogoView(odds))
 
 
 @bot.tree.command(name="pix", description="Transfere Pilas para outro usuário")
@@ -865,10 +915,22 @@ async def saldo(interaction: discord.Interaction):
 @bot.tree.command(name="jogos", description="Lista os jogos de hoje com as odds")
 async def jogos(interaction: discord.Interaction):
     await interaction.response.defer()
-    odds = await obter_todas_odds()
+
+    # FIX: mesma otimização do /apostar -- busca uma vez só (sem filtro) e
+    # filtra localmente, em vez de disparar a busca de rede duas vezes.
+    # Também usa o wrapper com timeout geral (obter_todas_odds_com_timeout)
+    # como rede de segurança contra qualquer travamento inesperado.
+    odds_completas, erro = await obter_todas_odds_com_timeout(apenas_hoje=False)
+    hoje = (datetime.utcnow() - timedelta(hours=3)).date()
+    odds = filtrar_odds_por_hoje(odds_completas, hoje)
+
     if not odds:
-        odds_completas = await obter_todas_odds(apenas_hoje=False)
-        hoje = (datetime.utcnow() - timedelta(hours=3)).date()
+        if erro:
+            # FIX: mostra o motivo REAL em vez de "Sem jogos hoje!" -- isso
+            # estava escondendo erros de configuração (chave de API ausente,
+            # todas as regiões falhando) atrás de uma mensagem que parecia
+            # dizer "não há jogo", quando na verdade a busca nem funcionou.
+            return await interaction.followup.send(f"⚠️ Não consegui buscar os jogos: {erro}")
         proxima_data = encontrar_proxima_data_com_jogo(odds_completas, hoje)
         if proxima_data:
             return await interaction.followup.send(
@@ -1084,7 +1146,7 @@ async def debugodds(interaction: discord.Interaction):
     linhas = []
     for regiao in REGIOES_TENTATIVAS:
         url = f"https://api.the-odds-api.com/v4/sports/soccer_brazil_campeonato/odds/?apiKey={API_KEY}&regions={regiao}&markets=h2h"
-        resposta = await asyncio.to_thread(requests.get, url)
+        resposta = await asyncio.to_thread(requests.get, url, timeout=10)
         restantes = resposta.headers.get('x-requests-remaining', '?')
         if resposta.status_code == 200:
             dados = resposta.json()
@@ -1196,7 +1258,14 @@ async def on_ready():
     except Exception as e:
         print(f"[sync] Erro ao sincronizar slash commands: {e}")
 
-
+    # FIX: essa era a causa raiz mais provável do bug. reconciliar_apostas_orfas()
+    # e retomar_simulacoes() não tinham try/except -- se qualquer uma delas
+    # lançasse uma exceção (erro de banco, canal inacessível, dado corrompido),
+    # o on_ready() parava ali mesmo e as duas linhas que INICIAM o loop de
+    # verificação de resultados (mais embaixo) nunca eram executadas. O bot
+    # ficava "online" normalmente, mas o loop que paga as apostas nunca começava
+    # a rodar. Agora cada etapa é isolada, então uma falha numa não impede as
+    # outras nem impede o início dos loops.
     try:
         reconciliar_apostas_orfas()
     except Exception as e:
