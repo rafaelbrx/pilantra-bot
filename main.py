@@ -1196,14 +1196,7 @@ async def on_ready():
     except Exception as e:
         print(f"[sync] Erro ao sincronizar slash commands: {e}")
 
-    # FIX: essa era a causa raiz mais provável do bug. reconciliar_apostas_orfas()
-    # e retomar_simulacoes() não tinham try/except -- se qualquer uma delas
-    # lançasse uma exceção (erro de banco, canal inacessível, dado corrompido),
-    # o on_ready() parava ali mesmo e as duas linhas que INICIAM o loop de
-    # verificação de resultados (mais embaixo) nunca eram executadas. O bot
-    # ficava "online" normalmente, mas o loop que paga as apostas nunca começava
-    # a rodar. Agora cada etapa é isolada, então uma falha numa não impede as
-    # outras nem impede o início dos loops.
+
     try:
         reconciliar_apostas_orfas()
     except Exception as e:
