@@ -5,6 +5,7 @@ import os
 import requests
 import random
 import asyncio
+import traceback
 from datetime import datetime, timedelta
 from keep_alive import keep_alive
 from db import get_conn, init_db
@@ -840,28 +841,56 @@ class ResultadoModal(discord.ui.Modal, title="Processar Resultado Oficial"):
 @bot.tree.command(name="apostar", description="Abre o menu para apostar nos jogos do dia")
 async def apostar(interaction: discord.Interaction):
     await interaction.response.defer()
+    try:
+        print("[apostar] iniciando busca de odds...")
+        # FIX: antes chamava obter_todas_odds() até 2x (uma filtrada, outra sem
+        # filtro) -- cada chamada dispara até 3 requisições HTTP (fallback de
+        # região), ou seja, até 6 chamadas de rede sequenciais num único comando.
+        # Agora busca uma vez só e filtra localmente em memória.
+        odds_completas, erro = await obter_todas_odds_com_timeout(apenas_hoje=False)
+        print(f"[apostar] busca concluída. {len(odds_completas)} jogo(s) no total, erro={erro}")
 
-    # FIX: antes chamava obter_todas_odds() até 2x (uma filtrada, outra sem
-    # filtro) -- cada chamada dispara até 3 requisições HTTP (fallback de
-    # região), ou seja, até 6 chamadas de rede sequenciais num único comando.
-    # Agora busca uma vez só e filtra localmente em memória.
-    odds_completas, erro = await obter_todas_odds_com_timeout(apenas_hoje=False)
-    hoje = (datetime.utcnow() - timedelta(hours=3)).date()
-    odds = filtrar_odds_por_hoje(odds_completas, hoje)
+        hoje = (datetime.utcnow() - timedelta(hours=3)).date()
+        odds = filtrar_odds_por_hoje(odds_completas, hoje)
+        print(f"[apostar] {len(odds)} jogo(s) após filtrar por hoje")
 
-    if not odds:
-        if erro:
-            # FIX: mostra o motivo REAL (chave de API ausente, todas as
-            # regiões falharam, etc.) em vez de deixar parecer que
-            # simplesmente não há jogo -- isso estava mascarando erros de
-            # configuração como se fosse "sem jogos hoje".
-            return await interaction.followup.send(f"⚠️ Não consegui buscar os jogos: {erro}")
-        proxima_data = encontrar_proxima_data_com_jogo(odds_completas, hoje)
-        if proxima_data:
-            return await interaction.followup.send(
-                f"❌ Não há jogos hoje. O próximo jogo é em **{formatar_data_extenso(proxima_data)}**.")
-        return await interaction.followup.send("❌ Não há jogos abertos no momento.")
-    await interaction.followup.send("👇 **Selecione a partida:**", view=JogoView(odds))
+        if not odds:
+            if erro:
+                # FIX: mostra o motivo REAL (chave de API ausente, todas as
+                # regiões falharam, etc.) em vez de deixar parecer que
+                # simplesmente não há jogo -- isso estava mascarando erros de
+                # configuração como se fosse "sem jogos hoje".
+                print("[apostar] enviando mensagem de erro...")
+                await interaction.followup.send(f"⚠️ Não consegui buscar os jogos: {erro}")
+                print("[apostar] mensagem de erro enviada.")
+                return
+            proxima_data = encontrar_proxima_data_com_jogo(odds_completas, hoje)
+            print("[apostar] enviando mensagem de 'sem jogos'...")
+            if proxima_data:
+                await interaction.followup.send(
+                    f"❌ Não há jogos hoje. O próximo jogo é em **{formatar_data_extenso(proxima_data)}**.")
+            else:
+                await interaction.followup.send("❌ Não há jogos abertos no momento.")
+            print("[apostar] mensagem de 'sem jogos' enviada.")
+            return
+
+        print("[apostar] construindo JogoView...")
+        view = JogoView(odds)
+        print("[apostar] enviando followup com a view...")
+        await interaction.followup.send("👇 **Selecione a partida:**", view=view)
+        print("[apostar] followup enviado com sucesso.")
+
+    except Exception:
+        # FIX: rede de segurança final -- qualquer exceção não prevista em
+        # nenhum dos pontos acima agora fica com traceback COMPLETO no log
+        # (não só a mensagem curta do erro), e o usuário sempre recebe uma
+        # resposta em vez de ficar com o comando travado sem resposta nenhuma.
+        print("[apostar] EXCEÇÃO NÃO TRATADA:")
+        traceback.print_exc()
+        try:
+            await interaction.followup.send("❌ Deu erro inesperado ao buscar os jogos. Já registrei os detalhes no log.")
+        except Exception as e2:
+            print(f"[apostar] Não consegui nem enviar a mensagem de erro: {e2}")
 
 
 @bot.tree.command(name="pix", description="Transfere Pilas para outro usuário")
@@ -915,36 +944,62 @@ async def saldo(interaction: discord.Interaction):
 @bot.tree.command(name="jogos", description="Lista os jogos de hoje com as odds")
 async def jogos(interaction: discord.Interaction):
     await interaction.response.defer()
+    try:
+        print("[jogos] iniciando busca de odds...")
+        # FIX: mesma otimização do /apostar -- busca uma vez só (sem filtro) e
+        # filtra localmente, em vez de disparar a busca de rede duas vezes.
+        # Também usa o wrapper com timeout geral (obter_todas_odds_com_timeout)
+        # como rede de segurança contra qualquer travamento inesperado.
+        odds_completas, erro = await obter_todas_odds_com_timeout(apenas_hoje=False)
+        print(f"[jogos] busca concluída. {len(odds_completas)} jogo(s) no total, erro={erro}")
 
-    # FIX: mesma otimização do /apostar -- busca uma vez só (sem filtro) e
-    # filtra localmente, em vez de disparar a busca de rede duas vezes.
-    # Também usa o wrapper com timeout geral (obter_todas_odds_com_timeout)
-    # como rede de segurança contra qualquer travamento inesperado.
-    odds_completas, erro = await obter_todas_odds_com_timeout(apenas_hoje=False)
-    hoje = (datetime.utcnow() - timedelta(hours=3)).date()
-    odds = filtrar_odds_por_hoje(odds_completas, hoje)
+        hoje = (datetime.utcnow() - timedelta(hours=3)).date()
+        odds = filtrar_odds_por_hoje(odds_completas, hoje)
+        print(f"[jogos] {len(odds)} jogo(s) após filtrar por hoje")
 
-    if not odds:
-        if erro:
-            # FIX: mostra o motivo REAL em vez de "Sem jogos hoje!" -- isso
-            # estava escondendo erros de configuração (chave de API ausente,
-            # todas as regiões falhando) atrás de uma mensagem que parecia
-            # dizer "não há jogo", quando na verdade a busca nem funcionou.
-            return await interaction.followup.send(f"⚠️ Não consegui buscar os jogos: {erro}")
-        proxima_data = encontrar_proxima_data_com_jogo(odds_completas, hoje)
-        if proxima_data:
-            return await interaction.followup.send(
-                f"⚽ **Sem jogos hoje!** O próximo jogo é em **{formatar_data_extenso(proxima_data)}**.")
-        return await interaction.followup.send("⚽ **Sem jogos hoje!**")
+        if not odds:
+            if erro:
+                # FIX: mostra o motivo REAL em vez de "Sem jogos hoje!" -- isso
+                # estava escondendo erros de configuração (chave de API ausente,
+                # todas as regiões falhando) atrás de uma mensagem que parecia
+                # dizer "não há jogo", quando na verdade a busca nem funcionou.
+                print("[jogos] enviando mensagem de erro...")
+                await interaction.followup.send(f"⚠️ Não consegui buscar os jogos: {erro}")
+                print("[jogos] mensagem de erro enviada.")
+                return
+            proxima_data = encontrar_proxima_data_com_jogo(odds_completas, hoje)
+            print("[jogos] enviando mensagem de 'sem jogos'...")
+            if proxima_data:
+                await interaction.followup.send(
+                    f"⚽ **Sem jogos hoje!** O próximo jogo é em **{formatar_data_extenso(proxima_data)}**.")
+            else:
+                await interaction.followup.send("⚽ **Sem jogos hoje!**")
+            print("[jogos] mensagem de 'sem jogos' enviada.")
+            return
 
-    embed = discord.Embed(title="⚽ Jogos de Hoje", color=discord.Color.green())
-    for jogo, info in odds.items():
-        texto = (f"**{info['Vencedor_Casa']}** ({info['Odd_Casa']}) ou "
-                 f"**{info['Vencedor_Fora']}** ({info['Odd_Fora']})\n"
-                 f"⏰ {info['Horario']}")
-        embed.add_field(name=jogo, value=texto, inline=False)
+        print("[jogos] construindo embed...")
+        embed = discord.Embed(title="⚽ Jogos de Hoje", color=discord.Color.green())
+        for jogo, info in odds.items():
+            texto = (f"**{info['Vencedor_Casa']}** ({info['Odd_Casa']}) ou "
+                     f"**{info['Vencedor_Fora']}** ({info['Odd_Fora']})\n"
+                     f"⏰ {info['Horario']}")
+            embed.add_field(name=jogo, value=texto, inline=False)
 
-    await interaction.followup.send(embed=embed)
+        print("[jogos] enviando followup com o embed...")
+        await interaction.followup.send(embed=embed)
+        print("[jogos] followup enviado com sucesso.")
+
+    except Exception:
+        # FIX: rede de segurança final -- qualquer exceção não prevista em
+        # nenhum dos pontos acima agora fica com traceback COMPLETO no log
+        # (não só a mensagem curta do erro), e o usuário sempre recebe uma
+        # resposta em vez de ficar com o comando travado sem resposta nenhuma.
+        print("[jogos] EXCEÇÃO NÃO TRATADA:")
+        traceback.print_exc()
+        try:
+            await interaction.followup.send("❌ Deu erro inesperado ao buscar os jogos. Já registrei os detalhes no log.")
+        except Exception as e2:
+            print(f"[jogos] Não consegui nem enviar a mensagem de erro: {e2}")
 
 
 @bot.tree.command(name="palpites", description="Mostra suas apostas registradas")
