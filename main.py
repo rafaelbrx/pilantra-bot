@@ -1297,21 +1297,35 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 # Startup
 # ---------------------------------------------------------------------------
 
+# FIX: on_ready() pode disparar mais de uma vez no mesmo processo (toda
+# reconexão ao gateway do Discord, não só o primeiro boot). Sem essa trava,
+# cada reconexão refaz bot.tree.sync() -- uma chamada pesada à API do Discord.
+# Reconexões em sequência rápida (ex.: durante um crash loop no Render) podem
+# somar requisições suficientes pra Cloudflare bloquear o IP temporariamente
+# (erro 1015 "you are being rate limited"), derrubando TODOS os comandos.
+_slash_commands_ja_sincronizados = False
+
+
 @bot.event
 async def on_ready():
     print(f'🔥 Pilantra online como {bot.user}')
 
-    try:
-        if DEV_GUILD_ID:
-            guild = discord.Object(id=int(DEV_GUILD_ID))
-            bot.tree.copy_global_to(guild=guild)
-            synced = await bot.tree.sync(guild=guild)
-            print(f"[sync] {len(synced)} slash commands sincronizados no servidor de testes {DEV_GUILD_ID}.")
-        else:
-            synced = await bot.tree.sync()
-            print(f"[sync] {len(synced)} slash commands sincronizados globalmente (pode levar até 1h pra propagar).")
-    except Exception as e:
-        print(f"[sync] Erro ao sincronizar slash commands: {e}")
+    global _slash_commands_ja_sincronizados
+    if _slash_commands_ja_sincronizados:
+        print("[sync] Reconexão detectada -- pulando novo bot.tree.sync() (já sincronizado nesta execução).")
+    else:
+        try:
+            if DEV_GUILD_ID:
+                guild = discord.Object(id=int(DEV_GUILD_ID))
+                bot.tree.copy_global_to(guild=guild)
+                synced = await bot.tree.sync(guild=guild)
+                print(f"[sync] {len(synced)} slash commands sincronizados no servidor de testes {DEV_GUILD_ID}.")
+            else:
+                synced = await bot.tree.sync()
+                print(f"[sync] {len(synced)} slash commands sincronizados globalmente (pode levar até 1h pra propagar).")
+            _slash_commands_ja_sincronizados = True
+        except Exception as e:
+            print(f"[sync] Erro ao sincronizar slash commands: {e}")
 
     # FIX: essa era a causa raiz mais provável do bug. reconciliar_apostas_orfas()
     # e retomar_simulacoes() não tinham try/except -- se qualquer uma delas
