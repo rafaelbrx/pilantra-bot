@@ -5,13 +5,15 @@ DATABASE_URL = os.environ.get('DATABASE_URL')
 
 
 def get_conn():
+
     if not DATABASE_URL:
         raise RuntimeError(
             "⚠️ A variável DATABASE_URL não foi encontrada. Configure-a no painel "
-            "do Render com a connection string do Supabase (formato: "
+            "do Render com a connection string do Supabase/Neon (formato: "
             "postgresql://usuario:senha@host:porta/nome_do_banco)."
         )
-    return psycopg2.connect(DATABASE_URL, sslmode='require')
+        
+    return psycopg2.connect(DATABASE_URL, sslmode='require', connect_timeout=10)
 
 
 def init_db():
