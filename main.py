@@ -1074,6 +1074,166 @@ async def mendigar(interaction: discord.Interaction):
     await interaction.response.send_message(f"🥺 O sistema teve pena. Você recebeu **100 Pilas**! Saldo: {novo}")
 
 
+# ---------------------------------------------------------------------------
+# Roleta (cassino) -- lógica pura, testável sem depender do Discord
+# ---------------------------------------------------------------------------
+
+ROLETA_CORES = {
+    "vermelho": {"emoji": "🔴", "label": "Vermelho", "multiplicador": 2, "peso": 7},
+    "preto":    {"emoji": "⚫", "label": "Preto",    "multiplicador": 2, "peso": 7},
+    "verde":    {"emoji": "🟢", "label": "Verde (Zebra)", "multiplicador": 14, "peso": 1},
+}
+
+
+def sortear_cor_roleta() -> str:
+    """Sorteia a cor vencedora respeitando os pesos (vermelho/preto comuns,
+    verde raro -- a zebra que paga 14x)."""
+    cores = list(ROLETA_CORES.keys())
+    pesos = [ROLETA_CORES[c]["peso"] for c in cores]
+    return random.choices(cores, weights=pesos, k=1)[0]
+
+
+def gerar_fita_roleta(resultado: str, tamanho: int = 30) -> list:
+    """Gera a 'fita' de emojis embaralhada que a roleta desliza durante a
+    animação, garantindo que a última posição seja o resultado sorteado
+    (é nela que a janela vai parar)."""
+    cores = list(ROLETA_CORES.keys())
+    pesos = [ROLETA_CORES[c]["peso"] for c in cores]
+    fita = [random.choices(cores, weights=pesos, k=1)[0] for _ in range(tamanho)]
+    fita[-1] = resultado
+    return [ROLETA_CORES[c]["emoji"] for c in fita]
+
+
+def renderizar_janela_roleta(fita_emojis: list, indice_central: int, janela: int = 5) -> str:
+    """Recorta uma janela da fita centrada em `indice_central` e destaca o
+    emoji do meio -- é isso que dá o efeito visual de 'a bolinha passando'."""
+    metade = janela // 2
+    inicio = max(0, indice_central - metade)
+    fim = min(len(fita_emojis), inicio + janela)
+    inicio = max(0, fim - janela)  # reajusta se bateu no fim da fita
+
+    partes = []
+    for i in range(inicio, fim):
+        if i == indice_central:
+            partes.append(f"【{fita_emojis[i]}】")
+        else:
+            partes.append(fita_emojis[i])
+    return "  ".join(partes)
+
+
+@bot.tree.command(name="roleta", description="Aposte na roleta estilo cassino: vermelho, preto ou a zebra verde")
+@app_commands.describe(cor="Em qual cor você tá confiando?", valor="Quantos Pilas vai colocar na mesa")
+@app_commands.choices(cor=[
+    app_commands.Choice(name="🔴 Vermelho (paga 2x)", value="vermelho"),
+    app_commands.Choice(name="⚫ Preto (paga 2x)", value="preto"),
+    app_commands.Choice(name="🟢 Verde -- a zebra (paga 14x)", value="verde"),
+])
+async def roleta(interaction: discord.Interaction, cor: app_commands.Choice[str], valor: int):
+    cor_escolhida = cor.value
+    id_usuario = str(interaction.user.id)
+
+    # --- Validação + débito da aposta -----------------------------------
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        if valor <= 0:
+            return await interaction.response.send_message("❌ Aposta tem que ser maior que zero, parceiro.", ephemeral=True)
+
+        c.execute("SELECT saldo FROM usuarios WHERE id_discord = %s", (id_usuario,))
+        res = c.fetchone()
+        if not res:
+            return await interaction.response.send_message("❌ Você ainda não tem banca aberta! Usa `/registrar` primeiro.", ephemeral=True)
+
+        saldo_atual = int(res[0])
+        if valor > saldo_atual:
+            return await interaction.response.send_message(
+                f"💸 Calma, apostador! Você só tem **{saldo_atual} Pilas** na conta -- essa aposta é maior que sua banca.",
+                ephemeral=True)
+
+        # Desconta ANTES de girar a roleta -- se der ruim depois, o prejuízo já era.
+        novo_saldo = saldo_atual - valor
+        c.execute("UPDATE usuarios SET saldo = %s WHERE id_discord = %s", (novo_saldo, id_usuario))
+        conn.commit()
+    finally:
+        # FIX: fecha a conexão ANTES do loop de animação com asyncio.sleep --
+        # segurar uma conexão aberta durante 8-10s de animação prende um slot
+        # do pool à toa e pode travar outros comandos rodando ao mesmo tempo.
+        conn.close()
+
+    # --- Sorteio + animação (sem NENHUMA conexão de banco aberta aqui) ---
+    resultado = sortear_cor_roleta()
+    fita = gerar_fita_roleta(resultado, tamanho=30)
+    indice_final = len(fita) - 1
+
+    embed = discord.Embed(
+        title="🎰 A roleta tá girando...",
+        description=renderizar_janela_roleta(fita, 2),
+        color=discord.Color.dark_grey(),
+    )
+    embed.set_footer(text=f"{interaction.user.display_name} apostou {valor} Pilas no {ROLETA_CORES[cor_escolhida]['label']}")
+    await interaction.response.send_message(embed=embed)
+    msg = await interaction.original_response()
+
+    # Checkpoints crescentes até o índice final, com delay progressivo pra
+    # simular a roleta desacelerando até frear no resultado.
+    checkpoints = [2, 6, 11, 16, 20, 23, 25, 27, indice_final]
+    delays =      [0.6, 0.6, 0.6, 0.7, 0.7, 0.8, 0.9, 1.0, 1.3]
+    for indice, delay in zip(checkpoints, delays):
+        await asyncio.sleep(delay)
+        embed.description = renderizar_janela_roleta(fita, indice)
+        try:
+            await msg.edit(embed=embed)
+        except discord.HTTPException as e:
+            print(f"[roleta] Falha ao editar animação (ignorando, segue pro resultado final): {e}")
+
+    # --- Resultado final ---------------------------------------------------
+    ganhou = (resultado == cor_escolhida)
+    info_resultado = ROLETA_CORES[resultado]
+    info_aposta = ROLETA_CORES[cor_escolhida]
+
+    if ganhou:
+        retorno_total = valor * info_resultado["multiplicador"]
+        # Reabre uma conexão rápida só pra creditar o prêmio.
+        conn = get_conn()
+        c = conn.cursor()
+        try:
+            c.execute("SELECT saldo FROM usuarios WHERE id_discord = %s", (id_usuario,))
+            saldo_pos_aposta = int(c.fetchone()[0])
+            saldo_final = saldo_pos_aposta + retorno_total
+            c.execute("UPDATE usuarios SET saldo = %s WHERE id_discord = %s", (saldo_final, id_usuario))
+            conn.commit()
+        finally:
+            conn.close()
+
+        lucro = retorno_total - valor
+        if resultado == "verde":
+            embed.title = "🟢 GREEEEN! CAIU NA ZEBRA!"
+            embed.description = (f"{renderizar_janela_roleta(fita, indice_final)}\n\n"
+                                  f"Não acredito que você teve coragem e ainda acertou a zebra! "
+                                  f"Pagou **14x**! Lucro de **{lucro} Pilas**!")
+        else:
+            embed.title = f"{info_resultado['emoji']} GREEN! Bateu certinho!"
+            embed.description = (f"{renderizar_janela_roleta(fita, indice_final)}\n\n"
+                                  f"A bolinha caiu no **{info_resultado['label']}**, igualzinho seu palpite. "
+                                  f"Green de **{lucro} Pilas**!")
+        embed.color = discord.Color.green()
+        embed.set_footer(text=f"Saldo atual: {saldo_final} Pilas")
+    else:
+        embed.title = f"{info_resultado['emoji']} RED! Não foi dessa vez"
+        embed.description = (f"{renderizar_janela_roleta(fita, indice_final)}\n\n"
+                              f"A roleta parou no **{info_resultado['label']}**, e você tinha ido de "
+                              f"**{info_aposta['label']}**. Foi um loss de **{valor} Pilas** -- "
+                              f"a banca agradece, volta pra tentar de novo!")
+        embed.color = discord.Color.red()
+        embed.set_footer(text=f"Saldo atual: {novo_saldo} Pilas")
+
+    try:
+        await msg.edit(embed=embed)
+    except discord.HTTPException as e:
+        print(f"[roleta] Falha ao editar mensagem final: {e}")
+        await interaction.followup.send(embed=embed)
+
+
 @bot.tree.command(name="ping", description="Testa se o bot está online")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message(f"🏓 Pong! Latência: {round(bot.latency * 1000)}ms")
@@ -1090,6 +1250,7 @@ async def comandos(interaction: discord.Interaction):
     embed.add_field(name="/salario", value="Resgata 350 Pilas de salário diário (a cada 72h).", inline=False)
     embed.add_field(name="/pix", value="Transfere Pilas para outro usuário.", inline=False)
     embed.add_field(name="/mendigar", value="Solicita 100 Pilas de graça (a cada 24h).", inline=False)
+    embed.add_field(name="/roleta", value="Aposta na roleta do cassino: vermelho, preto ou a zebra verde (14x).", inline=False)
     embed.add_field(name="/ranking", value="Mostra o ranking dos usuários com mais Pilas.", inline=False)
     embed.add_field(name="Administração", value="/resultado, /simular, /addsaldo, /remsaldo, /remaposta, /apostasdodia", inline=False)
     await interaction.response.send_message(embed=embed)
