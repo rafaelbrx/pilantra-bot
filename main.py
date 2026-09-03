@@ -4,6 +4,7 @@ from discord.ext import commands, tasks
 import os
 import requests
 import random
+import math
 import asyncio
 import traceback
 from datetime import datetime, timedelta
@@ -1313,6 +1314,210 @@ async def roleta(interaction: discord.Interaction, valor: int):
     view.message = await interaction.original_response()
 
 
+# ---------------------------------------------------------------------------
+# Crash / Aviator (cassino) -- lógica pura, testável sem depender do Discord
+# ---------------------------------------------------------------------------
+
+CRASH_CHANCE_INSTANTANEO = 0.05   # 5% de o foguete quebrar direto em 1.00x
+CRASH_MULTIPLICADOR_MAXIMO = 50.0  # teto -- ninguém sai rico DEMAIS
+CRASH_TAXA_CRESCIMENTO = 0.15      # velocidade de subida do multiplicador por tick
+CRASH_MAX_TICKS = 40               # rede de segurança contra loop infinito
+CRASH_DELAY_TICK = 1.5             # segundos entre cada atualização visual (>= 1.5s exigido)
+
+
+def calcular_ponto_de_quebra() -> float:
+    """Sorteia em que multiplicador o foguete explode.
+
+    A casa garante a vantagem em DUAS camadas:
+    1) 5% de chance de instacrash em 1.00x -- perda total garantida nesses casos,
+       não importa a estratégia do jogador.
+    2) Nos outros 95%, usa a fórmula hiperbólica clássica de jogos crash
+       (ponto = 0.99 / (1 - r), r uniforme em [0,1)). Sem o fator 0.99, essa
+       fórmula sozinha já seria "justa" (RTP de 100% para quem sempre saca no
+       mesmo multiplicador fixo, já que P(quebra >= m) = 1/m). O fator 0.99
+       reduz isso pra ~99% de RTP nessa camada.
+
+    Resultado combinado: para um jogador que sempre tenta sacar num
+    multiplicador fixo m, o retorno esperado é ~0.95 * 0.99 ≈ 94% -- ou seja,
+    a banca fica com uma vantagem líquida de ~6% sobre qualquer estratégia,
+    sem precisar torcer nenhum resultado individual.
+    """
+    if random.random() < CRASH_CHANCE_INSTANTANEO:
+        return 1.00
+    r = random.random()  # [0.0, 1.0) -- nunca bate 1.0, então nunca divide por zero
+    # FIX: sem o piso em 1.00, valores de r próximos de 0 geram pontos abaixo
+    # de 1.00x (ex.: r=0 -> 0.99x), o que não faz sentido -- o foguete não
+    # pode "quebrar" abaixo de onde decolou. O piso também empurra mais uma
+    # fatia de rodadas pra perda total, reforçando a vantagem da casa.
+    ponto = max(1.00, 0.99 / (1 - r))
+    return round(min(ponto, CRASH_MULTIPLICADOR_MAXIMO), 2)
+
+
+def calcular_multiplicador_no_tick(tick: int) -> float:
+    """Curva exponencial de subida do multiplicador -- começa devagar e
+    acelera, dando aquele suspense de foguete decolando. tick=0 -> 1.00x."""
+    return round(math.exp(CRASH_TAXA_CRESCIMENTO * tick), 2)
+
+
+class CrashView(discord.ui.View):
+    """Botão de Retirar do jogo Crash. Se comunica com o loop principal via
+    `self.retirou` -- assim que vira True, o loop de animação para na
+    próxima checagem."""
+
+    def __init__(self, autor_id: int, valor: int):
+        super().__init__(timeout=90)
+        self.autor_id = autor_id
+        self.valor = valor
+        self.retirou = False
+        self.encerrado = False  # True quando o jogo já terminou (saque OU explosão)
+        self.multiplicador_atual = 1.00
+        self.message: discord.Message | None = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.autor_id:
+            await interaction.response.send_message("⛔ Esse foguete não é seu -- chama o seu com `/crash`.", ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self):
+        # Não deveria disparar na prática (o loop principal sempre encerra a
+        # view antes dos 90s), mas cobre qualquer travamento inesperado.
+        if self.encerrado or self.message is None:
+            return
+        self.encerrado = True
+        for item in self.children:
+            item.disabled = True
+        try:
+            await self.message.edit(view=self)
+        except discord.HTTPException:
+            pass
+
+    @discord.ui.button(label="💰 Retirar", style=discord.ButtonStyle.success)
+    async def botao_retirar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.encerrado:
+            return await interaction.response.send_message("🚀 Já era, esse foguete já decidiu o destino dele.", ephemeral=True)
+
+        self.retirou = True
+        self.encerrado = True
+        multiplicador_saque = self.multiplicador_atual
+        button.disabled = True
+        self.stop()
+
+        ganho_total = int(self.valor * multiplicador_saque)
+        lucro = ganho_total - self.valor
+        id_usuario = str(interaction.user.id)
+
+        # FIX: conexão aberta EXCLUSIVAMENTE aqui dentro do callback, e
+        # fechada logo em seguida -- isolando por completo a lógica
+        # financeira do saque do loop de animação (que não abre banco nenhum).
+        conn = get_conn()
+        c = conn.cursor()
+        try:
+            c.execute("SELECT saldo FROM usuarios WHERE id_discord = %s", (id_usuario,))
+            res = c.fetchone()
+            saldo_atual = int(res[0]) if res else 0
+            saldo_final = saldo_atual + ganho_total
+            c.execute("UPDATE usuarios SET saldo = %s WHERE id_discord = %s", (saldo_final, id_usuario))
+            conn.commit()
+        finally:
+            conn.close()
+
+        embed = discord.Embed(
+            title=f"💸 GREEN! Sacou em {multiplicador_saque:.2f}x",
+            description="Foi rápido, mas foi esperto -- tirou o pé do acelerador na hora certa.",
+            color=discord.Color.green(),
+        )
+        embed.add_field(name="Aposta", value=f"{self.valor} Pilas", inline=True)
+        embed.add_field(name="Multiplicador", value=f"{multiplicador_saque:.2f}x", inline=True)
+        embed.add_field(name="Lucro", value=f"+{lucro} Pilas", inline=True)
+        embed.set_footer(text=f"Saldo atual: {saldo_final} Pilas")
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
+@bot.tree.command(name="crash", description="Aposte no foguete -- retire antes dele explodir!")
+@app_commands.describe(valor="Quantos Pilas você quer arriscar no foguete")
+async def crash(interaction: discord.Interaction, valor: int):
+    if valor <= 0:
+        return await interaction.response.send_message("❌ Aposta tem que ser maior que zero, parceiro.", ephemeral=True)
+
+    id_usuario = str(interaction.user.id)
+
+    # --- Validação + débito da aposta -----------------------------------
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        c.execute("SELECT saldo FROM usuarios WHERE id_discord = %s", (id_usuario,))
+        res = c.fetchone()
+        if not res:
+            return await interaction.response.send_message("❌ Você ainda não tem banca aberta! Usa `/registrar` primeiro.", ephemeral=True)
+
+        saldo_atual = int(res[0])
+        if valor > saldo_atual:
+            return await interaction.response.send_message(
+                f"💸 Calma, apostador! Você só tem **{saldo_atual} Pilas** -- desce o valor da aposta.", ephemeral=True)
+
+        # Desconta ANTES de o foguete decolar -- se explodir, o prejuízo já era.
+        novo_saldo = saldo_atual - valor
+        c.execute("UPDATE usuarios SET saldo = %s WHERE id_discord = %s", (novo_saldo, id_usuario))
+        conn.commit()
+    finally:
+        # FIX: fecha a conexão ANTES do loop de animação com asyncio.sleep --
+        # é ESTRITAMENTE PROIBIDO segurar o banco aberto durante a decolagem.
+        conn.close()
+
+    ponto_de_quebra = calcular_ponto_de_quebra()
+    view = CrashView(autor_id=interaction.user.id, valor=valor)
+
+    embed = discord.Embed(
+        title="🚀 Decolando...",
+        description="**1.00x** 🚀\n\nClica em 💰 Retirar antes do foguete explodir!",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(name="Aposta", value=f"{valor} Pilas", inline=False)
+    await interaction.response.send_message(embed=embed, view=view)
+    view.message = await interaction.original_response()
+
+    # --- Loop da animação (SEM NENHUMA conexão de banco aberta aqui) -----
+    tick = 0
+    while tick < CRASH_MAX_TICKS:
+        if view.retirou:
+            return  # o próprio botão já creditou o saque e editou a mensagem
+
+        multiplicador_atual = calcular_multiplicador_no_tick(tick)
+        if multiplicador_atual >= ponto_de_quebra:
+            break  # chegou (ou passou) do ponto de quebra -- exibe o crash abaixo
+
+        view.multiplicador_atual = multiplicador_atual
+        embed.description = f"**{multiplicador_atual:.2f}x** 🚀\n\nClica em 💰 Retirar antes do foguete explodir!"
+        try:
+            await interaction.edit_original_response(embed=embed)
+        except discord.HTTPException as e:
+            print(f"[crash] Falha ao editar animação (ignorando, o jogo continua): {e}")
+
+        # FIX: pausa >= 1.5s pra não estourar rate limit da API do Discord.
+        await asyncio.sleep(CRASH_DELAY_TICK)
+        tick += 1
+
+    if view.retirou:
+        return  # checagem final -- cobre o caso raro de retirada bem no instante do crash
+
+    # --- Explodiu antes do usuário retirar --------------------------------
+    view.encerrado = True
+    for item in view.children:
+        item.disabled = True
+
+    embed.title = "💥 CRASHOU!"
+    embed.description = f"O foguete explodiu em **{ponto_de_quebra:.2f}x**. Foi um loss de **{valor} Pilas** -- a banca agradece, meu consagrado."
+    embed.color = discord.Color.red()
+    embed.clear_fields()
+    embed.add_field(name="Aposta perdida", value=f"-{valor} Pilas", inline=True)
+    embed.add_field(name="Quebrou em", value=f"{ponto_de_quebra:.2f}x", inline=True)
+    try:
+        await interaction.edit_original_response(embed=embed, view=view)
+    except discord.HTTPException as e:
+        print(f"[crash] Falha ao editar mensagem final: {e}")
+
+
 
 @bot.tree.command(name="ping", description="Testa se o bot está online")
 async def ping(interaction: discord.Interaction):
@@ -1331,6 +1536,7 @@ async def comandos(interaction: discord.Interaction):
     embed.add_field(name="/pix", value="Transfere Pilas para outro usuário.", inline=False)
     embed.add_field(name="/mendigar", value="Solicita 100 Pilas de graça (a cada 24h).", inline=False)
     embed.add_field(name="/roleta", value="Abre a roleta do cassino: escolha vermelho, preto (2x) ou verde (14x) nos botões.", inline=False)
+    embed.add_field(name="/crash", value="Aposta no foguete -- retire antes dele explodir para multiplicar sua aposta.", inline=False)
     embed.add_field(name="/ranking", value="Mostra o ranking dos usuários com mais Pilas.", inline=False)
     embed.add_field(name="Administração", value="/resultado, /simular, /addsaldo, /remsaldo, /remaposta, /apostasdodia", inline=False)
     await interaction.response.send_message(embed=embed)
