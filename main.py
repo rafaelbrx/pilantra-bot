@@ -32,32 +32,22 @@ init_db()
 # Integração com a The Odds API
 # ---------------------------------------------------------------------------
 
-# FIX: o Brasileirão não tem cobertura consistente entre os bookmakers da
-# região "eu" (europeus). Tentamos várias regiões em ordem até encontrar
-# alguma com odds — respostas totalmente vazias não consomem quota extra,
-# então esse fallback não sai caro na maioria dos casos.
 REGIOES_TENTATIVAS = ["eu", "uk", "us"]
 
 
 def buscar_odds_do_dia():
     API_KEY = os.environ.get('ODDS_API_KEY')
     if not API_KEY:
-        # FIX: esse caso retornava sem nenhum log -- se a env var estivesse
-        # ausente/errada no Render, não sobraria nenhuma pista no log de por
-        # que os jogos não aparecem. Agora fica registrado explicitamente.
         print("[buscar_odds_do_dia] ODDS_API_KEY não encontrada nas variáveis de ambiente do Render.")
         return None, "⚠️ A variável `ODDS_API_KEY` não foi encontrada no Render!"
 
     dados = None
     regiao_usada = None
-    houve_sucesso_http = False  # pelo menos uma região respondeu 200, mesmo que vazia
+    houve_sucesso_http = False
 
     for regiao in REGIOES_TENTATIVAS:
         url = f"https://api.the-odds-api.com/v4/sports/soccer_brazil_campeonato/odds/?apiKey={API_KEY}&regions={regiao}&markets=h2h"
         try:
-            # FIX: requests.get sem timeout espera INDEFINIDAMENTE se a API ou
-            # a rede travar -- é isso que fazia o /jogos ficar "pensando" pra
-            # sempre. Com timeout, uma trava vira um erro tratável em até 10s.
             resposta = requests.get(url, timeout=10)
         except requests.exceptions.Timeout:
             print(f"[buscar_odds_do_dia] Timeout (10s) na região '{regiao}' -- pulando para a próxima.")
@@ -67,8 +57,7 @@ def buscar_odds_do_dia():
             continue
 
         restantes = resposta.headers.get('x-requests-remaining')
-        print(f"[buscar_odds_do_dia] região={regiao} status={resposta.status_code} "
-              f"requests-restantes={restantes}")
+        print(f"[buscar_odds_do_dia] região={regiao} status={resposta.status_code} requests-restantes={restantes}")
 
         if resposta.status_code != 200:
             print(f"[buscar_odds_do_dia] Erro na API (região '{regiao}'): {resposta.text[:300]}")
@@ -76,34 +65,24 @@ def buscar_odds_do_dia():
 
         houve_sucesso_http = True
         candidato = resposta.json()
-        # FIX: log de diagnóstico -- mostra quantos jogos vieram e quantos
-        # já têm pelo menos 1 bookmaker com odds, pra facilitar depuração
-        # via logs do Render sem precisar adivinhar.
+        
         n_jogos = len(candidato)
         n_com_odds = sum(1 for j in candidato if j.get("bookmakers"))
-        print(f"[buscar_odds_do_dia] região={regiao}: {n_jogos} jogo(s) retornado(s), "
-              f"{n_com_odds} com odds disponíveis.")
+        print(f"[buscar_odds_do_dia] região={regiao}: {n_jogos} jogo(s) retornado(s), {n_com_odds} com odds disponíveis.")
 
         if n_com_odds > 0:
             dados = candidato
             regiao_usada = regiao
             break
         elif dados is None and n_jogos > 0:
-            # guarda como fallback: pelo menos tem os jogos (mesmo sem odds),
-            # melhor que nada caso nenhuma região tenha bookmaker cobrindo
             dados = candidato
             regiao_usada = regiao
 
     if dados is None:
         if houve_sucesso_http:
-            # FIX: nenhuma região tem jogo nenhum listado (não é erro de rede/API,
-            # é legitimamente "sem rodada agora" — ex.: fora de temporada ou
-            # intervalo entre rodadas). Trata como sucesso com lista vazia,
-            # igual o comportamento original, em vez de mostrar erro ao usuário.
             print("[buscar_odds_do_dia] Nenhuma região retornou jogos — sem rodada no momento.")
             return {}, "Sucesso"
-        return None, ("⚠️ Nenhuma região respondeu com sucesso à API. "
-                       "Confira os logs do Render para mais detalhes.")
+        return None, ("⚠️ Nenhuma região respondeu com sucesso à API. Confira os logs do Render para mais detalhes.")
 
     print(f"[buscar_odds_do_dia] Usando dados da região '{regiao_usada}'.")
 
@@ -151,8 +130,7 @@ def buscar_odds_do_dia():
         conn.close()
 
         if not odds_do_dia:
-            print(f"[buscar_odds_do_dia] {len(dados)} jogo(s) na resposta, mas nenhum tinha "
-                  f"bookmaker com mercado h2h aberto ainda (comum entre rodadas ou dias antes do jogo).")
+            print(f"[buscar_odds_do_dia] {len(dados)} jogo(s) na resposta, mas nenhum tinha bookmaker com mercado h2h aberto ainda.")
 
         return odds_do_dia, "Sucesso"
     except Exception as e:
@@ -179,37 +157,22 @@ def buscar_resultados_api():
 
 async def obter_todas_odds(apenas_hoje: bool = True):
     odds, erro = await asyncio.to_thread(buscar_odds_do_dia)
-    # FIX: antes, qualquer falha real (chave de API ausente, todas as regiões
-    # falhando, etc.) virava silenciosamente um dict vazio -- e /jogos mostrava
-    # "Sem jogos hoje!" mesmo quando o problema era outro. Agora o motivo do
-    # erro é propagado junto, para o comando poder mostrar a causa real.
     erro_real = erro if odds is None else None
     if odds is None:
         odds = {}
 
-    # jogos simulados (cassino) entram sempre, independente do filtro de data --
-    # são eventos de curta duração criados sob demanda, resolvidos pelo próprio timer.
     odds = dict(odds)
     odds.update(jogos_simulados)
 
     if not apenas_hoje:
         return odds, erro_real
 
-    # FIX: restringe a apenas os jogos de HOJE. Isso evita que o menu de
-    # apostas (/apostar) fique sujeito ao limite de 25 opções do Discord
-    # somando jogos de vários dias -- com uma rodada completa do Brasileirão
-    # (~10 jogos/dia), sobrar só os jogos de hoje garante que nenhum jogo
-    # desapareça silenciosamente do menu.
     hoje = (datetime.utcnow() - timedelta(hours=3)).date()
     odds = {jogo: info for jogo, info in odds.items() if info["Horario_DT"].date() == hoje}
     return odds, erro_real
 
 
 async def obter_todas_odds_com_timeout(apenas_hoje: bool = True, segundos: int = 25):
-    """Rede de segurança final: mesmo com timeout em cada chamada de rede
-    individual (API de odds e Postgres), um travamento inesperado em
-    qualquer outro ponto não deveria fazer o comando 'pensar' pra sempre.
-    Isso garante uma resposta (de erro, se preciso) em no máximo `segundos`."""
     try:
         return await asyncio.wait_for(obter_todas_odds(apenas_hoje=apenas_hoje), timeout=segundos)
     except asyncio.TimeoutError:
@@ -219,8 +182,6 @@ async def obter_todas_odds_com_timeout(apenas_hoje: bool = True, segundos: int =
 
 
 def filtrar_odds_por_hoje(odds_completas: dict, hoje) -> dict:
-    """Filtra localmente (sem nova chamada de rede) um dicionário de odds já
-    obtido, mantendo só os jogos de hoje + qualquer jogo simulado."""
     return {
         jogo: info for jogo, info in odds_completas.items()
         if info["Horario_DT"].date() == hoje or jogo in jogos_simulados
@@ -235,9 +196,6 @@ def formatar_data_extenso(data) -> str:
 
 
 def encontrar_proxima_data_com_jogo(odds_completas: dict, hoje):
-    """Dado o dicionário de odds SEM filtro de data (apenas_hoje=False), acha
-    a data mais próxima, no futuro, que tenha algum jogo. Usado para avisar
-    o usuário quando não há jogos hoje."""
     datas_futuras = sorted({
         info["Horario_DT"].date()
         for info in odds_completas.values()
@@ -339,9 +297,6 @@ def reconciliar_apostas_orfas():
 
 
 async def retomar_simulacoes():
-    """FIX: no startup, recarrega jogos de cassino que ainda não foram
-    resolvidos (o bot reiniciou no meio da rodada) e retoma o timer, ou
-    resolve na hora se o tempo já tiver estourado."""
     conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT jogo, t_casa, odd_casa, t_fora, odd_fora, horario_resolucao, channel_id FROM jogos_simulados_db")
@@ -476,24 +431,12 @@ import unicodedata
 
 
 def normalizar_nome_jogo(texto: str) -> str:
-    """Normaliza nomes de jogo/time para comparação tolerante a acentos,
-    caixa alta/baixa e espaços extras -- ex.: 'São Paulo' casa com 'Sao Paulo '.
-    Usado para casar o nome do jogo vindo do endpoint /scores com o nome
-    salvo no banco (vindo do endpoint /odds), que às vezes vêm escritos
-    de forma levemente diferente."""
     sem_acento = unicodedata.normalize('NFKD', texto).encode('ASCII', 'ignore').decode('ASCII')
     return " ".join(sem_acento.casefold().split())
 
 
 @tasks.loop(minutes=5)
 async def verificar_resultados_loop():
-    # FIX: toda a função agora roda dentro de um try/except. O decorator
-    # @tasks.loop do discord.py PARA DE RODAR PARA SEMPRE se uma exceção não
-    # tratada escapar do corpo da função -- sem aviso nenhum no Discord, só
-    # nos logs. Isso explica o padrão relatado: com vários jogos simultâneos,
-    # bastava UM deles ter um dado inesperado (placar nulo, jogo adiado, nome
-    # de time com grafia diferente entre /odds e /scores) para o loop inteiro
-    # travar e nenhuma aposta nunca mais ser resolvida, nem dos outros jogos.
     try:
         await _verificar_resultados_loop_corpo()
     except Exception as e:
@@ -502,9 +445,6 @@ async def verificar_resultados_loop():
 
 @verificar_resultados_loop.error
 async def verificar_resultados_loop_error(error):
-    # Rede de segurança extra: se mesmo assim uma exceção escapar (ex.: erro
-    # dentro do próprio decorator/scheduler), reinicia o loop em vez de
-    # deixá-lo morto até o próximo redeploy.
     print(f"[verificar_resultados_loop] Task crashou de forma inesperada: {error}")
     if not verificar_resultados_loop.is_running():
         print("[verificar_resultados_loop] Reiniciando a task automaticamente...")
@@ -548,16 +488,9 @@ async def _verificar_resultados_loop_corpo():
     if not dados:
         return
 
-    # FIX: lookup tolerante a acentos/caixa/espaços -- casa "Sao Paulo x ..."
-    # (scores) com "São Paulo x ..." (salvo no banco a partir do /odds) mesmo
-    # que a grafia exata não bata 100%.
     jogos_pendentes_norm = {normalizar_nome_jogo(j): j for j in jogos_pendentes}
 
     for jogo in dados:
-        # FIX: cada jogo é processado dentro do seu próprio try/except. Se um
-        # jogo tiver dado incompleto/inesperado (placar nulo, time cancelado
-        # etc.), só ELE fica pendente pro próximo ciclo -- os demais jogos
-        # completados no mesmo lote continuam sendo pagos normalmente.
         try:
             if not jogo.get('completed'):
                 continue
@@ -568,12 +501,11 @@ async def _verificar_resultados_loop_corpo():
             jogo_id_real = jogos_pendentes_norm.get(normalizar_nome_jogo(jogo_id_api))
 
             if not jogo_id_real:
-                continue  # não é um jogo que alguém apostou
+                continue
 
             scores = jogo.get('scores')
             if not scores:
-                print(f"[verificar_resultados_loop] '{jogo_id_real}' está completed=True mas sem "
-                      f"placar (jogo adiado/cancelado?). Deixando pendente para o próximo ciclo.")
+                print(f"[verificar_resultados_loop] '{jogo_id_real}' está completed=True mas sem placar.")
                 continue
 
             score_casa = score_fora = 0
@@ -595,11 +527,10 @@ async def _verificar_resultados_loop_corpo():
                 await channel.send(f"🚨 **O JOGO ACABOU!**\n⚽ Placar Final: **{t_casa} {score_casa} x {score_fora} {t_fora}**\nProcessando os pagamentos do bot...")
                 await processar_resultado_interno(channel, jogo_id_real, vencedor)
             else:
-                print(f"[verificar_resultados_loop] Canal de resultados ({CANAL_RESULTADOS_ID}) não encontrado — não consegui anunciar '{jogo_id_real}'.")
+                print(f"[verificar_resultados_loop] Canal de resultados não encontrado.")
 
         except Exception as e:
-            print(f"[verificar_resultados_loop] Erro ao processar '{jogo.get('home_team')} x {jogo.get('away_team')}': {e}. "
-                  f"Esse jogo específico fica pendente para o próximo ciclo; os demais não são afetados.")
+            print(f"[verificar_resultados_loop] Erro ao processar resultado: {e}.")
             continue
 
 
@@ -611,12 +542,11 @@ async def enviar_ranking_diario():
         embed_repaginado = gerar_embed_ranking()
         await canal.send(content="⏰ **Fechamento do Mercado!** Olha como ficou o placar hoje:", embed=embed_repaginado)
     else:
-        # FIX: log em vez de falhar em silêncio.
         print(f"[enviar_ranking_diario] Canal de ranking ({CANAL_RANKING_ID}) não encontrado.")
 
 
 # ---------------------------------------------------------------------------
-# Modais e Views (inalterados na lógica, só passam a ser chamados por slash commands)
+# Modais e Views
 # ---------------------------------------------------------------------------
 
 class ApostaModal(discord.ui.Modal, title="Sua Aposta"):
@@ -843,50 +773,26 @@ class ResultadoModal(discord.ui.Modal, title="Processar Resultado Oficial"):
 async def apostar(interaction: discord.Interaction):
     await interaction.response.defer()
     try:
-        print("[apostar] iniciando busca de odds...")
-        # FIX: antes chamava obter_todas_odds() até 2x (uma filtrada, outra sem
-        # filtro) -- cada chamada dispara até 3 requisições HTTP (fallback de
-        # região), ou seja, até 6 chamadas de rede sequenciais num único comando.
-        # Agora busca uma vez só e filtra localmente em memória.
         odds_completas, erro = await obter_todas_odds_com_timeout(apenas_hoje=False)
-        print(f"[apostar] busca concluída. {len(odds_completas)} jogo(s) no total, erro={erro}")
-
         hoje = (datetime.utcnow() - timedelta(hours=3)).date()
         odds = filtrar_odds_por_hoje(odds_completas, hoje)
-        print(f"[apostar] {len(odds)} jogo(s) após filtrar por hoje")
 
         if not odds:
             if erro:
-                # FIX: mostra o motivo REAL (chave de API ausente, todas as
-                # regiões falharam, etc.) em vez de deixar parecer que
-                # simplesmente não há jogo -- isso estava mascarando erros de
-                # configuração como se fosse "sem jogos hoje".
-                print("[apostar] enviando mensagem de erro...")
                 await interaction.followup.send(f"⚠️ Não consegui buscar os jogos: {erro}")
-                print("[apostar] mensagem de erro enviada.")
                 return
             proxima_data = encontrar_proxima_data_com_jogo(odds_completas, hoje)
-            print("[apostar] enviando mensagem de 'sem jogos'...")
             if proxima_data:
                 await interaction.followup.send(
                     f"❌ Não há jogos hoje. O próximo jogo é em **{formatar_data_extenso(proxima_data)}**.")
             else:
                 await interaction.followup.send("❌ Não há jogos abertos no momento.")
-            print("[apostar] mensagem de 'sem jogos' enviada.")
             return
 
-        print("[apostar] construindo JogoView...")
         view = JogoView(odds)
-        print("[apostar] enviando followup com a view...")
         await interaction.followup.send("👇 **Selecione a partida:**", view=view)
-        print("[apostar] followup enviado com sucesso.")
 
     except Exception:
-        # FIX: rede de segurança final -- qualquer exceção não prevista em
-        # nenhum dos pontos acima agora fica com traceback COMPLETO no log
-        # (não só a mensagem curta do erro), e o usuário sempre recebe uma
-        # resposta em vez de ficar com o comando travado sem resposta nenhuma.
-        print("[apostar] EXCEÇÃO NÃO TRATADA:")
         traceback.print_exc()
         try:
             await interaction.followup.send("❌ Deu erro inesperado ao buscar os jogos. Já registrei os detalhes no log.")
@@ -946,39 +852,22 @@ async def saldo(interaction: discord.Interaction):
 async def jogos(interaction: discord.Interaction):
     await interaction.response.defer()
     try:
-        print("[jogos] iniciando busca de odds...")
-        # FIX: mesma otimização do /apostar -- busca uma vez só (sem filtro) e
-        # filtra localmente, em vez de disparar a busca de rede duas vezes.
-        # Também usa o wrapper com timeout geral (obter_todas_odds_com_timeout)
-        # como rede de segurança contra qualquer travamento inesperado.
         odds_completas, erro = await obter_todas_odds_com_timeout(apenas_hoje=False)
-        print(f"[jogos] busca concluída. {len(odds_completas)} jogo(s) no total, erro={erro}")
-
         hoje = (datetime.utcnow() - timedelta(hours=3)).date()
         odds = filtrar_odds_por_hoje(odds_completas, hoje)
-        print(f"[jogos] {len(odds)} jogo(s) após filtrar por hoje")
 
         if not odds:
             if erro:
-                # FIX: mostra o motivo REAL em vez de "Sem jogos hoje!" -- isso
-                # estava escondendo erros de configuração (chave de API ausente,
-                # todas as regiões falhando) atrás de uma mensagem que parecia
-                # dizer "não há jogo", quando na verdade a busca nem funcionou.
-                print("[jogos] enviando mensagem de erro...")
                 await interaction.followup.send(f"⚠️ Não consegui buscar os jogos: {erro}")
-                print("[jogos] mensagem de erro enviada.")
                 return
             proxima_data = encontrar_proxima_data_com_jogo(odds_completas, hoje)
-            print("[jogos] enviando mensagem de 'sem jogos'...")
             if proxima_data:
                 await interaction.followup.send(
                     f"⚽ **Sem jogos hoje!** O próximo jogo é em **{formatar_data_extenso(proxima_data)}**.")
             else:
                 await interaction.followup.send("⚽ **Sem jogos hoje!**")
-            print("[jogos] mensagem de 'sem jogos' enviada.")
             return
 
-        print("[jogos] construindo embed...")
         embed = discord.Embed(title="⚽ Jogos de Hoje", color=discord.Color.green())
         for jogo, info in odds.items():
             texto = (f"**{info['Vencedor_Casa']}** ({info['Odd_Casa']}) ou "
@@ -986,16 +875,9 @@ async def jogos(interaction: discord.Interaction):
                      f"⏰ {info['Horario']}")
             embed.add_field(name=jogo, value=texto, inline=False)
 
-        print("[jogos] enviando followup com o embed...")
         await interaction.followup.send(embed=embed)
-        print("[jogos] followup enviado com sucesso.")
 
     except Exception:
-        # FIX: rede de segurança final -- qualquer exceção não prevista em
-        # nenhum dos pontos acima agora fica com traceback COMPLETO no log
-        # (não só a mensagem curta do erro), e o usuário sempre recebe uma
-        # resposta em vez de ficar com o comando travado sem resposta nenhuma.
-        print("[jogos] EXCEÇÃO NÃO TRATADA:")
         traceback.print_exc()
         try:
             await interaction.followup.send("❌ Deu erro inesperado ao buscar os jogos. Já registrei os detalhes no log.")
@@ -1076,7 +958,7 @@ async def mendigar(interaction: discord.Interaction):
 
 
 # ---------------------------------------------------------------------------
-# Roleta (cassino) -- lógica pura, testável sem depender do Discord
+# Roleta (cassino)
 # ---------------------------------------------------------------------------
 
 ROLETA_CORES = {
@@ -1089,17 +971,12 @@ ROLETA_BORDA = "━━━━━━━━━━━━━━━━━━━━"
 
 
 def sortear_cor_roleta() -> str:
-    """Sorteia a cor vencedora respeitando os pesos (vermelho/preto comuns,
-    verde raro -- paga 14x)."""
     cores = list(ROLETA_CORES.keys())
     pesos = [ROLETA_CORES[c]["peso"] for c in cores]
     return random.choices(cores, weights=pesos, k=1)[0]
 
 
 def gerar_fita_roleta(resultado: str, tamanho: int = 30) -> list:
-    """Gera a 'fita' de emojis embaralhada que a roleta desliza durante a
-    animação, garantindo que a última posição seja o resultado sorteado
-    (é nela que a janela vai parar)."""
     cores = list(ROLETA_CORES.keys())
     pesos = [ROLETA_CORES[c]["peso"] for c in cores]
     fita = [random.choices(cores, weights=pesos, k=1)[0] for _ in range(tamanho)]
@@ -1108,13 +985,10 @@ def gerar_fita_roleta(resultado: str, tamanho: int = 30) -> list:
 
 
 def renderizar_janela_roleta(fita_emojis: list, indice_central: int, janela: int = 5) -> str:
-    """Recorta uma janela da fita centrada em `indice_central`, destaca o
-    emoji do meio e desenha uma borda decorativa em volta -- dá o efeito
-    visual de 'a bolinha passando' dentro de uma roleta de verdade."""
     metade = janela // 2
     inicio = max(0, indice_central - metade)
     fim = min(len(fita_emojis), inicio + janela)
-    inicio = max(0, fim - janela)  # reajusta se bateu no fim da fita
+    inicio = max(0, fim - janela)
 
     partes = []
     for i in range(inicio, fim):
@@ -1127,14 +1001,9 @@ def renderizar_janela_roleta(fita_emojis: list, indice_central: int, janela: int
 
 
 async def executar_roleta(interaction: discord.Interaction, valor: int, cor_escolhida: str):
-    """Roda o jogo completo depois que o usuário já escolheu a cor no botão:
-    revalida saldo, debita, anima e resolve o resultado."""
     id_usuario = str(interaction.user.id)
     info_aposta = ROLETA_CORES[cor_escolhida]
 
-    # --- Revalidação + débito da aposta -----------------------------------
-    # (revalida de novo aqui, mesmo já tendo checado em /roleta, porque o
-    # saldo pode ter mudado entre a mensagem aparecer e o clique no botão)
     conn = get_conn()
     c = conn.cursor()
     try:
@@ -1151,17 +1020,12 @@ async def executar_roleta(interaction: discord.Interaction, valor: int, cor_esco
                                    color=discord.Color.red())
             return await interaction.response.edit_message(embed=embed, view=None)
 
-        # Desconta ANTES de girar a roleta -- se der ruim depois, o prejuízo já era.
         novo_saldo = saldo_atual - valor
         c.execute("UPDATE usuarios SET saldo = %s WHERE id_discord = %s", (novo_saldo, id_usuario))
         conn.commit()
     finally:
-        # FIX: fecha a conexão ANTES do loop de animação com asyncio.sleep --
-        # segurar uma conexão aberta durante 8-10s de animação prende um slot
-        # do pool à toa e pode travar outros comandos rodando ao mesmo tempo.
         conn.close()
 
-    # --- Sorteio + animação (sem NENHUMA conexão de banco aberta aqui) ---
     resultado = sortear_cor_roleta()
     fita = gerar_fita_roleta(resultado, tamanho=30)
     indice_final = len(fita) - 1
@@ -1174,8 +1038,6 @@ async def executar_roleta(interaction: discord.Interaction, valor: int, cor_esco
     embed.add_field(name="Aposta", value=f"{valor} Pilas no {info_aposta['emoji']} **{info_aposta['label']}**", inline=False)
     await interaction.response.edit_message(embed=embed, view=None)
 
-    # Checkpoints crescentes até o índice final, com delay progressivo pra
-    # simular a roleta desacelerando até frear no resultado.
     checkpoints = [2, 6, 11, 16, 20, 23, 25, 27, indice_final]
     delays =      [0.6, 0.6, 0.6, 0.7, 0.7, 0.8, 0.9, 1.0, 1.3]
     for indice, delay in zip(checkpoints, delays):
@@ -1186,7 +1048,6 @@ async def executar_roleta(interaction: discord.Interaction, valor: int, cor_esco
         except discord.HTTPException as e:
             print(f"[roleta] Falha ao editar animação (ignorando, segue pro resultado final): {e}")
 
-    # --- Resultado final ---------------------------------------------------
     ganhou = (resultado == cor_escolhida)
     info_resultado = ROLETA_CORES[resultado]
     embed.description = renderizar_janela_roleta(fita, indice_final)
@@ -1196,7 +1057,6 @@ async def executar_roleta(interaction: discord.Interaction, valor: int, cor_esco
 
     if ganhou:
         retorno_total = valor * info_resultado["multiplicador"]
-        # Reabre uma conexão rápida só pra creditar o prêmio.
         conn = get_conn()
         c = conn.cursor()
         try:
@@ -1227,9 +1087,6 @@ async def executar_roleta(interaction: discord.Interaction, valor: int, cor_esco
 
 
 class RoletaEscolhaView(discord.ui.View):
-    """Botões pra escolher a cor depois do /roleta -- substitui o antigo
-    parâmetro de cor no próprio comando."""
-
     def __init__(self, autor_id: int, valor: int):
         super().__init__(timeout=30)
         self.autor_id = autor_id
@@ -1258,7 +1115,7 @@ class RoletaEscolhaView(discord.ui.View):
             pass
 
     async def _escolher(self, interaction: discord.Interaction, cor: str):
-        self.stop()  # cancela o timeout, já que o usuário escolheu
+        self.stop()
         await executar_roleta(interaction, self.valor, cor)
 
     @discord.ui.button(label="Vermelho", emoji="🔴", style=discord.ButtonStyle.danger)
@@ -1315,61 +1172,48 @@ async def roleta(interaction: discord.Interaction, valor: int):
 
 
 # ---------------------------------------------------------------------------
-# Crash / Aviator (cassino) -- lógica pura, testável sem depender do Discord
+# Crash / Aviator (cassino)
 # ---------------------------------------------------------------------------
 
-CRASH_CHANCE_INSTANTANEO = 0.05   # 5% de o foguete quebrar direto em 1.00x
-CRASH_MULTIPLICADOR_MAXIMO = 50.0  # teto -- ninguém sai rico DEMAIS
-CRASH_TAXA_CRESCIMENTO = 0.15      # velocidade de subida do multiplicador por tick
-CRASH_MAX_TICKS = 40               # rede de segurança contra loop infinito
-CRASH_DELAY_TICK = 1.5             # segundos entre cada atualização visual (>= 1.5s exigido)
+CRASH_CHANCE_INSTANTANEO = 0.05
+CRASH_MULTIPLICADOR_MAXIMO = 50.0
+CRASH_TAXA_CRESCIMENTO = 0.15
+CRASH_MAX_TICKS = 40
+CRASH_DELAY_TICK = 1.5
 
 
 def calcular_ponto_de_quebra() -> float:
-    """Sorteia em que multiplicador o foguete explode.
-
-    A casa garante a vantagem em DUAS camadas:
-    1) 5% de chance de instacrash em 1.00x -- perda total garantida nesses casos,
-       não importa a estratégia do jogador.
-    2) Nos outros 95%, usa a fórmula hiperbólica clássica de jogos crash
-       (ponto = 0.99 / (1 - r), r uniforme em [0,1)). Sem o fator 0.99, essa
-       fórmula sozinha já seria "justa" (RTP de 100% para quem sempre saca no
-       mesmo multiplicador fixo, já que P(quebra >= m) = 1/m). O fator 0.99
-       reduz isso pra ~99% de RTP nessa camada.
-
-    Resultado combinado: para um jogador que sempre tenta sacar num
-    multiplicador fixo m, o retorno esperado é ~0.95 * 0.99 ≈ 94% -- ou seja,
-    a banca fica com uma vantagem líquida de ~6% sobre qualquer estratégia,
-    sem precisar torcer nenhum resultado individual.
-    """
     if random.random() < CRASH_CHANCE_INSTANTANEO:
         return 1.00
-    r = random.random()  # [0.0, 1.0) -- nunca bate 1.0, então nunca divide por zero
-    # FIX: sem o piso em 1.00, valores de r próximos de 0 geram pontos abaixo
-    # de 1.00x (ex.: r=0 -> 0.99x), o que não faz sentido -- o foguete não
-    # pode "quebrar" abaixo de onde decolou. O piso também empurra mais uma
-    # fatia de rodadas pra perda total, reforçando a vantagem da casa.
+    r = random.random()
     ponto = max(1.00, 0.99 / (1 - r))
     return round(min(ponto, CRASH_MULTIPLICADOR_MAXIMO), 2)
 
 
 def calcular_multiplicador_no_tick(tick: int) -> float:
-    """Curva exponencial de subida do multiplicador -- começa devagar e
-    acelera, dando aquele suspense de foguete decolando. tick=0 -> 1.00x."""
     return round(math.exp(CRASH_TAXA_CRESCIMENTO * tick), 2)
 
 
-class CrashView(discord.ui.View):
-    """Botão de Retirar do jogo Crash. Se comunica com o loop principal via
-    `self.retirou` -- assim que vira True, o loop de animação para na
-    próxima checagem."""
+def gerar_grafico_foguete(tick: int, explodiu: bool = False) -> str:
+    """Gera um gráfico visual em texto simulando a curva exponencial do Crash"""
+    blocos = [" ", " ", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+    curva = ""
+    for i in range(tick + 1):
+        altura = min(8, int((i / 12) ** 3 * 8)) if i < 15 else 8
+        curva += blocos[altura]
+    if len(curva) > 18:
+        curva = curva[-18:]
+    icone = "💥" if explodiu else "🚀"
+    return f"📈 `{curva}`{icone}"
 
+
+class CrashView(discord.ui.View):
     def __init__(self, autor_id: int, valor: int):
         super().__init__(timeout=90)
         self.autor_id = autor_id
         self.valor = valor
         self.retirou = False
-        self.encerrado = False  # True quando o jogo já terminou (saque OU explosão)
+        self.encerrado = False
         self.multiplicador_atual = 1.00
         self.message: discord.Message | None = None
 
@@ -1380,8 +1224,6 @@ class CrashView(discord.ui.View):
         return True
 
     async def on_timeout(self):
-        # Não deveria disparar na prática (o loop principal sempre encerra a
-        # view antes dos 90s), mas cobre qualquer travamento inesperado.
         if self.encerrado or self.message is None:
             return
         self.encerrado = True
@@ -1407,9 +1249,6 @@ class CrashView(discord.ui.View):
         lucro = ganho_total - self.valor
         id_usuario = str(interaction.user.id)
 
-        # FIX: conexão aberta EXCLUSIVAMENTE aqui dentro do callback, e
-        # fechada logo em seguida -- isolando por completo a lógica
-        # financeira do saque do loop de animação (que não abre banco nenhum).
         conn = get_conn()
         c = conn.cursor()
         try:
@@ -1423,7 +1262,7 @@ class CrashView(discord.ui.View):
             conn.close()
 
         embed = discord.Embed(
-            title=f"💸 GREEN! Sacou em {multiplicador_saque:.2f}x",
+            title=f"💸 GREEN! {interaction.user.display_name} sacou em {multiplicador_saque:.2f}x",
             description="Foi rápido, mas foi esperto -- tirou o pé do acelerador na hora certa.",
             color=discord.Color.green(),
         )
@@ -1442,7 +1281,6 @@ async def crash(interaction: discord.Interaction, valor: int):
 
     id_usuario = str(interaction.user.id)
 
-    # --- Validação + débito da aposta -----------------------------------
     conn = get_conn()
     c = conn.cursor()
     try:
@@ -1456,58 +1294,55 @@ async def crash(interaction: discord.Interaction, valor: int):
             return await interaction.response.send_message(
                 f"💸 Calma, apostador! Você só tem **{saldo_atual} Pilas** -- desce o valor da aposta.", ephemeral=True)
 
-        # Desconta ANTES de o foguete decolar -- se explodir, o prejuízo já era.
         novo_saldo = saldo_atual - valor
         c.execute("UPDATE usuarios SET saldo = %s WHERE id_discord = %s", (novo_saldo, id_usuario))
         conn.commit()
     finally:
-        # FIX: fecha a conexão ANTES do loop de animação com asyncio.sleep --
-        # é ESTRITAMENTE PROIBIDO segurar o banco aberto durante a decolagem.
         conn.close()
 
     ponto_de_quebra = calcular_ponto_de_quebra()
     view = CrashView(autor_id=interaction.user.id, valor=valor)
 
+    curva_inicial = gerar_grafico_foguete(0)
     embed = discord.Embed(
-        title="🚀 Decolando...",
-        description="**1.00x** 🚀\n\nClica em 💰 Retirar antes do foguete explodir!",
+        title=f"🚀 Foguete de {interaction.user.display_name}",
+        description=f"{curva_inicial}\n\n**# 1.00x**\n\nClica em 💰 Retirar antes do foguete explodir!",
         color=discord.Color.blurple(),
     )
     embed.add_field(name="Aposta", value=f"{valor} Pilas", inline=False)
     await interaction.response.send_message(embed=embed, view=view)
     view.message = await interaction.original_response()
 
-    # --- Loop da animação (SEM NENHUMA conexão de banco aberta aqui) -----
     tick = 0
     while tick < CRASH_MAX_TICKS:
         if view.retirou:
-            return  # o próprio botão já creditou o saque e editou a mensagem
+            return
 
         multiplicador_atual = calcular_multiplicador_no_tick(tick)
         if multiplicador_atual >= ponto_de_quebra:
-            break  # chegou (ou passou) do ponto de quebra -- exibe o crash abaixo
+            break
 
         view.multiplicador_atual = multiplicador_atual
-        embed.description = f"**{multiplicador_atual:.2f}x** 🚀\n\nClica em 💰 Retirar antes do foguete explodir!"
+        curva_visual = gerar_grafico_foguete(tick)
+        embed.description = f"{curva_visual}\n\n**# {multiplicador_atual:.2f}x**\n\nClica em 💰 Retirar antes do foguete explodir!"
         try:
             await interaction.edit_original_response(embed=embed)
         except discord.HTTPException as e:
             print(f"[crash] Falha ao editar animação (ignorando, o jogo continua): {e}")
 
-        # FIX: pausa >= 1.5s pra não estourar rate limit da API do Discord.
         await asyncio.sleep(CRASH_DELAY_TICK)
         tick += 1
 
     if view.retirou:
-        return  # checagem final -- cobre o caso raro de retirada bem no instante do crash
+        return
 
-    # --- Explodiu antes do usuário retirar --------------------------------
     view.encerrado = True
     for item in view.children:
         item.disabled = True
 
-    embed.title = "💥 CRASHOU!"
-    embed.description = f"O foguete explodiu em **{ponto_de_quebra:.2f}x**. Foi um loss de **{valor} Pilas** -- a banca agradece, meu consagrado."
+    curva_morte = gerar_grafico_foguete(tick, explodiu=True)
+    embed.title = f"💥 O Foguete de {interaction.user.display_name} CRASHOU!"
+    embed.description = f"{curva_morte}\n\nO foguete explodiu em **{ponto_de_quebra:.2f}x**. Foi um loss de **{valor} Pilas** -- a banca agradece, meu consagrado."
     embed.color = discord.Color.red()
     embed.clear_fields()
     embed.add_field(name="Aposta perdida", value=f"-{valor} Pilas", inline=True)
@@ -1516,7 +1351,6 @@ async def crash(interaction: discord.Interaction, valor: int):
         await interaction.edit_original_response(embed=embed, view=view)
     except discord.HTTPException as e:
         print(f"[crash] Falha ao editar mensagem final: {e}")
-
 
 
 @bot.tree.command(name="ping", description="Testa se o bot está online")
@@ -1744,12 +1578,6 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 # Startup
 # ---------------------------------------------------------------------------
 
-# FIX: on_ready() pode disparar mais de uma vez no mesmo processo (toda
-# reconexão ao gateway do Discord, não só o primeiro boot). Sem essa trava,
-# cada reconexão refaz bot.tree.sync() -- uma chamada pesada à API do Discord.
-# Reconexões em sequência rápida (ex.: durante um crash loop no Render) podem
-# somar requisições suficientes pra Cloudflare bloquear o IP temporariamente
-# (erro 1015 "you are being rate limited"), derrubando TODOS os comandos.
 _slash_commands_ja_sincronizados = False
 
 
@@ -1774,14 +1602,6 @@ async def on_ready():
         except Exception as e:
             print(f"[sync] Erro ao sincronizar slash commands: {e}")
 
-    # FIX: essa era a causa raiz mais provável do bug. reconciliar_apostas_orfas()
-    # e retomar_simulacoes() não tinham try/except -- se qualquer uma delas
-    # lançasse uma exceção (erro de banco, canal inacessível, dado corrompido),
-    # o on_ready() parava ali mesmo e as duas linhas que INICIAM o loop de
-    # verificação de resultados (mais embaixo) nunca eram executadas. O bot
-    # ficava "online" normalmente, mas o loop que paga as apostas nunca começava
-    # a rodar. Agora cada etapa é isolada, então uma falha numa não impede as
-    # outras nem impede o início dos loops.
     try:
         reconciliar_apostas_orfas()
     except Exception as e:
