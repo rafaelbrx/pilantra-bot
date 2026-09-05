@@ -1175,39 +1175,112 @@ async def roleta(interaction: discord.Interaction, valor: int):
 # Crash / Aviator (cassino)
 # ---------------------------------------------------------------------------
 
-CRASH_CHANCE_INSTANTANEO = 0.05
-CRASH_MULTIPLICADOR_MAXIMO = 50.0
-CRASH_TAXA_CRESCIMENTO = 0.15
-CRASH_MAX_TICKS = 40
-CRASH_DELAY_TICK = 1.5
+CRASH_CHANCE_INSTANTANEO = 0.05    # 5% de o foguete quebrar direto em 1.00x
+CRASH_MULTIPLICADOR_MAXIMO = 50.0  # teto -- ninguém sai rico demais
+CRASH_TAXA_CRESCIMENTO = 0.15      # velocidade de subida do multiplicador por tick
+CRASH_MAX_TICKS = 40               # rede de segurança contra loop infinito
+CRASH_DELAY_TICK = 1.5             # segundos entre cada atualização visual (>= 1.5s obrigatório)
+
+_CRASH_LINHAS = 5      # linhas da grade do gráfico (de baixo pra cima)
+_CRASH_LARGURA = 16    # largura em colunas de tick exibidas
 
 
 def calcular_ponto_de_quebra() -> float:
+    """Sorteia em que multiplicador o foguete explode.
+
+    A casa garante a vantagem em duas camadas: 5% de chance de instacrash em
+    1.00x (perda total garantida), e nos outros 95% a fórmula hiperbólica
+    clássica de jogos crash (0.99 / (1 - r)), com piso em 1.00x e teto em 50x.
+    """
     if random.random() < CRASH_CHANCE_INSTANTANEO:
         return 1.00
-    r = random.random()
+    r = random.random()  # [0.0, 1.0) -- nunca bate 1.0, então nunca divide por zero
     ponto = max(1.00, 0.99 / (1 - r))
     return round(min(ponto, CRASH_MULTIPLICADOR_MAXIMO), 2)
 
 
 def calcular_multiplicador_no_tick(tick: int) -> float:
+    """Curva exponencial de subida do multiplicador -- começa devagar e
+    acelera. tick=0 -> 1.00x."""
     return round(math.exp(CRASH_TAXA_CRESCIMENTO * tick), 2)
 
 
-def gerar_grafico_foguete(tick: int, explodiu: bool = False) -> str:
-    """Gera um gráfico visual em texto simulando a curva exponencial do Crash"""
-    blocos = [" ", " ", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
-    curva = ""
-    for i in range(tick + 1):
-        altura = min(8, int((i / 12) ** 3 * 8)) if i < 15 else 8
-        curva += blocos[altura]
-    if len(curva) > 18:
-        curva = curva[-18:]
-    icone = "💥" if explodiu else "🚀"
-    return f"📈 `{curva}`{icone}"
+def _altura_normalizada(mult: float, mult_max_visivel: float) -> int:
+    """Retorna a linha (0 = base, _CRASH_LINHAS-1 = topo) de um multiplicador."""
+    if mult_max_visivel <= 1.0:
+        return 0
+    ratio = (mult - 1.0) / (mult_max_visivel - 1.0)
+    return min(_CRASH_LINHAS - 1, int(ratio * (_CRASH_LINHAS - 1) + 0.5))
+
+
+def gerar_grafico_crash(historico_ticks: list, tick_saque=None, tick_crash=None,
+                         explodiu_antes_do_saque: bool = False) -> str:
+    """Renderiza um gráfico de barras em ASCII (5 linhas x até 16 colunas) com
+    eixo Y de multiplicadores de referência, marcador 🟡 no tick do saque (se
+    houver) e marcador 💥 no tick do crash (se houver/já revelado)."""
+    todos_ticks = list(historico_ticks)
+    if tick_crash is not None and tick_crash not in todos_ticks:
+        todos_ticks.append(tick_crash)
+
+    janela = todos_ticks[-_CRASH_LARGURA:] if len(todos_ticks) > _CRASH_LARGURA else todos_ticks
+    if not janela:
+        janela = [0]
+
+    mults = {t: calcular_multiplicador_no_tick(t) for t in janela}
+    mult_max = max(mults.values())
+    mult_max_visivel = max(mult_max * 1.2, 1.5)  # 20% de margem no topo
+
+    labels_y = []
+    for row in range(_CRASH_LINHAS - 1, -1, -1):
+        ratio = row / (_CRASH_LINHAS - 1) if _CRASH_LINHAS > 1 else 0
+        val = 1.0 + ratio * (mult_max_visivel - 1.0)
+        labels_y.append(f"{val:.2f}x")
+
+    linhas_grid = []
+    for row in range(_CRASH_LINHAS - 1, -1, -1):
+        celulas = []
+        for t in janela:
+            h = _altura_normalizada(mults[t], mult_max_visivel)
+            if t == tick_crash and tick_crash is not None:
+                celula = "💥" if h == row else ("▓ " if h > row else "  ")
+            elif t == tick_saque and tick_saque is not None:
+                celula = "🟡" if h == row else ("▓ " if h > row else "  ")
+            else:
+                celula = "▓ " if h >= row else "  "
+            celulas.append(celula)
+        linhas_grid.append(celulas)
+
+    linhas_texto = []
+    for label, celulas in zip(labels_y, linhas_grid):
+        prefixo = f"`{label:>6} │ `"
+        conteudo = "".join(celulas)
+        linhas_texto.append(f"{prefixo}{conteudo}")
+
+    eixo_x = f"`{'':>6} └{'─' * (_CRASH_LARGURA * 2)}`"
+    linhas_texto.append(eixo_x)
+
+    partes_legenda = []
+    if tick_saque is not None:
+        mult_saque = calcular_multiplicador_no_tick(tick_saque)
+        partes_legenda.append(f"🟡 Sacou em **{mult_saque:.2f}x**")
+    if tick_crash is not None:
+        mult_crash_val = calcular_multiplicador_no_tick(tick_crash)
+        if explodiu_antes_do_saque or tick_saque is None:
+            partes_legenda.append(f"💥 Crashou em **{mult_crash_val:.2f}x**")
+        else:
+            partes_legenda.append(f"💥 Teria crashado em **{mult_crash_val:.2f}x**")
+
+    grafico = "\n".join(linhas_texto)
+    if partes_legenda:
+        grafico += "\n" + "  •  ".join(partes_legenda)
+    return grafico
 
 
 class CrashView(discord.ui.View):
+    """View do jogo Crash. Comunicação com o loop principal via `self.retirou`.
+    Após o saque, guarda `self.tick_saque` para o loop continuar animando a
+    curva em modo 'fantasma' até revelar onde o foguete teria explodido."""
+
     def __init__(self, autor_id: int, valor: int):
         super().__init__(timeout=90)
         self.autor_id = autor_id
@@ -1215,11 +1288,14 @@ class CrashView(discord.ui.View):
         self.retirou = False
         self.encerrado = False
         self.multiplicador_atual = 1.00
+        self.tick_atual = 0
+        self.tick_saque = None
         self.message: discord.Message | None = None
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.autor_id:
-            await interaction.response.send_message("⛔ Esse foguete não é seu -- chama o seu com `/crash`.", ephemeral=True)
+            await interaction.response.send_message(
+                "⛔ Esse foguete não é seu -- chama o seu com `/crash`.", ephemeral=True)
             return False
         return True
 
@@ -1237,10 +1313,12 @@ class CrashView(discord.ui.View):
     @discord.ui.button(label="💰 Retirar", style=discord.ButtonStyle.success)
     async def botao_retirar(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.encerrado:
-            return await interaction.response.send_message("🚀 Já era, esse foguete já decidiu o destino dele.", ephemeral=True)
+            return await interaction.response.send_message(
+                "🚀 Já era, esse foguete já decidiu o destino dele.", ephemeral=True)
 
         self.retirou = True
         self.encerrado = True
+        self.tick_saque = self.tick_atual
         multiplicador_saque = self.multiplicador_atual
         button.disabled = True
         self.stop()
@@ -1249,6 +1327,9 @@ class CrashView(discord.ui.View):
         lucro = ganho_total - self.valor
         id_usuario = str(interaction.user.id)
 
+        # FIX: conexão aberta EXCLUSIVAMENTE aqui dentro do callback, e
+        # fechada logo em seguida -- isolando por completo a lógica
+        # financeira do loop de animação (que não abre banco nenhum).
         conn = get_conn()
         c = conn.cursor()
         try:
@@ -1262,12 +1343,15 @@ class CrashView(discord.ui.View):
             conn.close()
 
         embed = discord.Embed(
-            title=f"💸 GREEN! {interaction.user.display_name} sacou em {multiplicador_saque:.2f}x",
-            description="Foi rápido, mas foi esperto -- tirou o pé do acelerador na hora certa.",
-            color=discord.Color.green(),
+            title=f"🟡 {interaction.user.display_name} sacou em {multiplicador_saque:.2f}x!",
+            description=(
+                f"Green de **+{lucro} Pilas** garantido no bolso.\n"
+                f"⏳ *Aguarda -- o foguete vai continuar pra você ver até onde ia...*"
+            ),
+            color=discord.Color.yellow(),
         )
         embed.add_field(name="Aposta", value=f"{self.valor} Pilas", inline=True)
-        embed.add_field(name="Multiplicador", value=f"{multiplicador_saque:.2f}x", inline=True)
+        embed.add_field(name="Sacou em", value=f"{multiplicador_saque:.2f}x", inline=True)
         embed.add_field(name="Lucro", value=f"+{lucro} Pilas", inline=True)
         embed.set_footer(text=f"Saldo atual: {saldo_final} Pilas")
         await interaction.response.edit_message(embed=embed, view=self)
@@ -1277,80 +1361,156 @@ class CrashView(discord.ui.View):
 @app_commands.describe(valor="Quantos Pilas você quer arriscar no foguete")
 async def crash(interaction: discord.Interaction, valor: int):
     if valor <= 0:
-        return await interaction.response.send_message("❌ Aposta tem que ser maior que zero, parceiro.", ephemeral=True)
+        return await interaction.response.send_message(
+            "❌ Aposta tem que ser maior que zero, parceiro.", ephemeral=True)
 
     id_usuario = str(interaction.user.id)
 
+    # --- Validação + débito (conexão fechada ANTES do loop de animação) ---
     conn = get_conn()
     c = conn.cursor()
     try:
         c.execute("SELECT saldo FROM usuarios WHERE id_discord = %s", (id_usuario,))
         res = c.fetchone()
         if not res:
-            return await interaction.response.send_message("❌ Você ainda não tem banca aberta! Usa `/registrar` primeiro.", ephemeral=True)
+            return await interaction.response.send_message(
+                "❌ Você ainda não tem banca aberta! Usa `/registrar` primeiro.", ephemeral=True)
 
         saldo_atual = int(res[0])
         if valor > saldo_atual:
             return await interaction.response.send_message(
-                f"💸 Calma, apostador! Você só tem **{saldo_atual} Pilas** -- desce o valor da aposta.", ephemeral=True)
+                f"💸 Calma, apostador! Você só tem **{saldo_atual} Pilas** -- desce o valor da aposta.",
+                ephemeral=True)
 
         novo_saldo = saldo_atual - valor
         c.execute("UPDATE usuarios SET saldo = %s WHERE id_discord = %s", (novo_saldo, id_usuario))
         conn.commit()
     finally:
-        conn.close()
+        conn.close()  # FECHADO antes de qualquer asyncio.sleep
 
     ponto_de_quebra = calcular_ponto_de_quebra()
     view = CrashView(autor_id=interaction.user.id, valor=valor)
 
-    curva_inicial = gerar_grafico_foguete(0)
+    historico = [0]
+    grafico_inicial = gerar_grafico_crash(historico, None, None)
     embed = discord.Embed(
         title=f"🚀 Foguete de {interaction.user.display_name}",
-        description=f"{curva_inicial}\n\n**# 1.00x**\n\nClica em 💰 Retirar antes do foguete explodir!",
+        description=f"{grafico_inicial}\n\n**1.00x** — Clica em 💰 Retirar antes de explodir!",
         color=discord.Color.blurple(),
     )
-    embed.add_field(name="Aposta", value=f"{valor} Pilas", inline=False)
+    embed.add_field(name="Aposta", value=f"{valor} Pilas", inline=True)
+    embed.add_field(name="Ponto de saque", value="—", inline=True)
     await interaction.response.send_message(embed=embed, view=view)
     view.message = await interaction.original_response()
 
     tick = 0
+
+    # -----------------------------------------------------------------------
+    # Fase 1: loop normal -- para quando o usuário saca ou quando crasha
+    # -----------------------------------------------------------------------
     while tick < CRASH_MAX_TICKS:
-        if view.retirou:
+        multiplicador_atual = calcular_multiplicador_no_tick(tick)
+
+        if multiplicador_atual >= ponto_de_quebra and not view.retirou:
+            # Crashou antes do saque
+            historico.append(tick)
+            grafico = gerar_grafico_crash(historico, None, tick, explodiu_antes_do_saque=True)
+            embed.title = f"💥 O Foguete de {interaction.user.display_name} CRASHOU!"
+            embed.description = (
+                f"{grafico}\n\n"
+                f"Explodiu em **{ponto_de_quebra:.2f}x** -- loss de **{valor} Pilas**. "
+                f"A banca agradece, meu consagrado."
+            )
+            embed.color = discord.Color.red()
+            embed.set_field_at(0, name="Aposta perdida", value=f"-{valor} Pilas", inline=True)
+            embed.set_field_at(1, name="Quebrou em", value=f"{ponto_de_quebra:.2f}x", inline=True)
+            view.encerrado = True
+            for item in view.children:
+                item.disabled = True
+            try:
+                await interaction.edit_original_response(embed=embed, view=view)
+            except discord.HTTPException as e:
+                print(f"[crash] Falha ao editar crash final: {e}")
             return
 
-        multiplicador_atual = calcular_multiplicador_no_tick(tick)
-        if multiplicador_atual >= ponto_de_quebra:
-            break
+        if view.retirou:
+            break  # usuário sacou -- sai do loop normal e cai na fase 2
 
         view.multiplicador_atual = multiplicador_atual
-        curva_visual = gerar_grafico_foguete(tick)
-        embed.description = f"{curva_visual}\n\n**# {multiplicador_atual:.2f}x**\n\nClica em 💰 Retirar antes do foguete explodir!"
+        view.tick_atual = tick
+        historico.append(tick)
+
+        grafico = gerar_grafico_crash(historico, None, None)
+        embed.description = f"{grafico}\n\n**{multiplicador_atual:.2f}x** — Clica em 💰 Retirar antes de explodir!"
+        embed.set_field_at(1, name="Ponto de saque", value="—", inline=True)
         try:
             await interaction.edit_original_response(embed=embed)
         except discord.HTTPException as e:
-            print(f"[crash] Falha ao editar animação (ignorando, o jogo continua): {e}")
+            print(f"[crash] Falha ao editar animação: {e}")
 
         await asyncio.sleep(CRASH_DELAY_TICK)
         tick += 1
 
-    if view.retirou:
-        return
+    if not view.retirou:
+        return  # já tratou o crash antes do saque acima
 
-    view.encerrado = True
-    for item in view.children:
-        item.disabled = True
+    # -----------------------------------------------------------------------
+    # Fase 2: usuário sacou -- continua animando (modo "fantasma") até o
+    # ponto de quebra real, revelando onde o foguete teria ido
+    # -----------------------------------------------------------------------
+    tick_saque = view.tick_saque or tick
+    mult_saque = calcular_multiplicador_no_tick(tick_saque)
 
-    curva_morte = gerar_grafico_foguete(tick, explodiu=True)
-    embed.title = f"💥 O Foguete de {interaction.user.display_name} CRASHOU!"
-    embed.description = f"{curva_morte}\n\nO foguete explodiu em **{ponto_de_quebra:.2f}x**. Foi um loss de **{valor} Pilas** -- a banca agradece, meu consagrado."
-    embed.color = discord.Color.red()
-    embed.clear_fields()
-    embed.add_field(name="Aposta perdida", value=f"-{valor} Pilas", inline=True)
-    embed.add_field(name="Quebrou em", value=f"{ponto_de_quebra:.2f}x", inline=True)
+    tick_ghost = tick_saque + 1
+    while tick_ghost < CRASH_MAX_TICKS:
+        mult_ghost = calcular_multiplicador_no_tick(tick_ghost)
+        historico.append(tick_ghost)
+
+        crashou_agora = mult_ghost >= ponto_de_quebra
+
+        grafico = gerar_grafico_crash(
+            historico, tick_saque=tick_saque,
+            tick_crash=tick_ghost if crashou_agora else None,
+        )
+
+        if crashou_agora:
+            embed.title = (
+                f"✅ {interaction.user.display_name} sacou em {mult_saque:.2f}x "
+                f"— Foguete crashou em {ponto_de_quebra:.2f}x"
+            )
+            embed.description = (
+                f"{grafico}\n\n"
+                f"{'🔥 Saiu antes -- boa decisão!' if mult_saque < ponto_de_quebra else '😅 Quase...'}"
+            )
+            embed.color = discord.Color.green()
+            try:
+                await interaction.edit_original_response(embed=embed, view=view)
+            except discord.HTTPException as e:
+                print(f"[crash] Falha ao editar reveal final: {e}")
+            return
+
+        embed.description = (
+            f"{grafico}\n\n"
+            f"🟡 Você sacou em **{mult_saque:.2f}x** | Foguete ainda voando em **{mult_ghost:.2f}x**..."
+        )
+        try:
+            await interaction.edit_original_response(embed=embed)
+        except discord.HTTPException as e:
+            print(f"[crash] Falha ao editar fantasma: {e}")
+
+        await asyncio.sleep(CRASH_DELAY_TICK)
+        tick_ghost += 1
+
+    # chegou no limite de ticks sem crashar (teto de 50x) -- reveal
+    mult_final = calcular_multiplicador_no_tick(tick_ghost - 1)
+    grafico = gerar_grafico_crash(historico, tick_saque=tick_saque, tick_crash=None)
+    embed.title = f"🚀 {interaction.user.display_name} sacou em {mult_saque:.2f}x — Foguete foi além!"
+    embed.description = f"{grafico}\n\nO foguete passou de **{mult_final:.2f}x** sem explodir. Impressionante."
+    embed.color = discord.Color.green()
     try:
         await interaction.edit_original_response(embed=embed, view=view)
     except discord.HTTPException as e:
-        print(f"[crash] Falha ao editar mensagem final: {e}")
+        print(f"[crash] Falha ao editar reveal final (sem crash): {e}")
 
 
 @bot.tree.command(name="ping", description="Testa se o bot está online")
