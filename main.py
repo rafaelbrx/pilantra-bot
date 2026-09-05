@@ -1205,75 +1205,47 @@ def calcular_multiplicador_no_tick(tick: int) -> float:
     return round(math.exp(CRASH_TAXA_CRESCIMENTO * tick), 2)
 
 
-def _altura_normalizada(mult: float, mult_max_visivel: float) -> int:
-    """Retorna a linha (0 = base, _CRASH_LINHAS-1 = topo) de um multiplicador."""
-    if mult_max_visivel <= 1.0:
-        return 0
-    ratio = (mult - 1.0) / (mult_max_visivel - 1.0)
-    return min(_CRASH_LINHAS - 1, int(ratio * (_CRASH_LINHAS - 1) + 0.5))
+_CRASH_BLOCOS = "▁▂▃▄▅▆▇█"  # 8 níveis de altura, monoespaçados, sem emoji misturado
 
 
-def gerar_grafico_crash(historico_ticks: list, tick_saque=None, tick_crash=None,
-                         explodiu_antes_do_saque: bool = False) -> str:
-    """Renderiza um gráfico de barras em ASCII (5 linhas x até 16 colunas) com
-    eixo Y de multiplicadores de referência, marcador 🟡 no tick do saque (se
-    houver) e marcador 💥 no tick do crash (se houver/já revelado)."""
-    todos_ticks = list(historico_ticks)
-    if tick_crash is not None and tick_crash not in todos_ticks:
-        todos_ticks.append(tick_crash)
+def gerar_sparkline(historico_mults: list) -> str:
+    """Renderiza a curva como uma única linha monoespaçada (estilo sparkline),
+    usando só caracteres de bloco -- sem misturar emoji no meio de texto
+    monoespaçado, que é o que quebrava o alinhamento da versão em grade."""
+    if not historico_mults:
+        return _CRASH_BLOCOS[0]
 
-    janela = todos_ticks[-_CRASH_LARGURA:] if len(todos_ticks) > _CRASH_LARGURA else todos_ticks
-    if not janela:
-        janela = [0]
+    janela = historico_mults[-_CRASH_LARGURA:] if len(historico_mults) > _CRASH_LARGURA else historico_mults
+    mult_max = max(janela)
+    mult_max_visivel = max(mult_max * 1.15, 1.3)  # margem no topo
 
-    mults = {t: calcular_multiplicador_no_tick(t) for t in janela}
-    mult_max = max(mults.values())
-    mult_max_visivel = max(mult_max * 1.2, 1.5)  # 20% de margem no topo
+    linha = []
+    for m in janela:
+        ratio = (m - 1.0) / max(mult_max_visivel - 1.0, 0.01)
+        idx = min(len(_CRASH_BLOCOS) - 1, max(0, round(ratio * (len(_CRASH_BLOCOS) - 1))))
+        linha.append(_CRASH_BLOCOS[idx])
+    return f"`{''.join(linha)}`"
 
-    labels_y = []
-    for row in range(_CRASH_LINHAS - 1, -1, -1):
-        ratio = row / (_CRASH_LINHAS - 1) if _CRASH_LINHAS > 1 else 0
-        val = 1.0 + ratio * (mult_max_visivel - 1.0)
-        labels_y.append(f"{val:.2f}x")
 
-    linhas_grid = []
-    for row in range(_CRASH_LINHAS - 1, -1, -1):
-        celulas = []
-        for t in janela:
-            h = _altura_normalizada(mults[t], mult_max_visivel)
-            if t == tick_crash and tick_crash is not None:
-                celula = "💥" if h == row else ("▓ " if h > row else "  ")
-            elif t == tick_saque and tick_saque is not None:
-                celula = "🟡" if h == row else ("▓ " if h > row else "  ")
-            else:
-                celula = "▓ " if h >= row else "  "
-            celulas.append(celula)
-        linhas_grid.append(celulas)
+def gerar_texto_status(sparkline: str, mult_atual: float, tick_saque_mult: float = None,
+                        valor_crash: float = None, explodiu_antes_do_saque: bool = False) -> str:
+    """Monta o texto completo mostrado no embed: sparkline + multiplicador
+    grande + anotações de saque/crash como linhas de texto separadas (não
+    dentro do bloco monoespaçado, evitando o problema de largura do emoji)."""
+    linhas = [sparkline, f"# {mult_atual:.2f}x"]
 
-    linhas_texto = []
-    for label, celulas in zip(labels_y, linhas_grid):
-        prefixo = f"`{label:>6} │ `"
-        conteudo = "".join(celulas)
-        linhas_texto.append(f"{prefixo}{conteudo}")
-
-    eixo_x = f"`{'':>6} └{'─' * (_CRASH_LARGURA * 2)}`"
-    linhas_texto.append(eixo_x)
-
-    partes_legenda = []
-    if tick_saque is not None:
-        mult_saque = calcular_multiplicador_no_tick(tick_saque)
-        partes_legenda.append(f"🟡 Sacou em **{mult_saque:.2f}x**")
-    if tick_crash is not None:
-        mult_crash_val = calcular_multiplicador_no_tick(tick_crash)
-        if explodiu_antes_do_saque or tick_saque is None:
-            partes_legenda.append(f"💥 Crashou em **{mult_crash_val:.2f}x**")
+    if tick_saque_mult is not None:
+        linhas.append(f"🟡 Você sacou em **{tick_saque_mult:.2f}x**")
+    if valor_crash is not None:
+        # FIX: usa SEMPRE o ponto_de_quebra real (o mesmo valor do título),
+        # nunca recalculado a partir de um tick discreto -- é isso que
+        # causava a divergência entre título e legenda (ex.: 4.84x vs 5.21x).
+        if explodiu_antes_do_saque or tick_saque_mult is None:
+            linhas.append(f"💥 Crashou em **{valor_crash:.2f}x**")
         else:
-            partes_legenda.append(f"💥 Teria crashado em **{mult_crash_val:.2f}x**")
+            linhas.append(f"💥 Teria crashado em **{valor_crash:.2f}x**")
 
-    grafico = "\n".join(linhas_texto)
-    if partes_legenda:
-        grafico += "\n" + "  •  ".join(partes_legenda)
-    return grafico
+    return "\n".join(linhas)
 
 
 class CrashView(discord.ui.View):
@@ -1290,6 +1262,7 @@ class CrashView(discord.ui.View):
         self.multiplicador_atual = 1.00
         self.tick_atual = 0
         self.tick_saque = None
+        self.embed = None  # referência ao MESMO Embed usado pelo loop principal
         self.message: discord.Message | None = None
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -1342,14 +1315,18 @@ class CrashView(discord.ui.View):
         finally:
             conn.close()
 
-        embed = discord.Embed(
-            title=f"🟡 {interaction.user.display_name} sacou em {multiplicador_saque:.2f}x!",
-            description=(
-                f"Green de **+{lucro} Pilas** garantido no bolso.\n"
-                f"⏳ *Aguarda -- o foguete vai continuar pra você ver até onde ia...*"
-            ),
-            color=discord.Color.yellow(),
+        embed = self.embed
+        # FIX: antes criava um discord.Embed() NOVO aqui, desconectado do
+        # objeto usado pelo loop principal em crash(). Quando a fase fantasma
+        # continuava e editava o embed ORIGINAL (sem os campos de lucro), o
+        # valor ganho desaparecia da mensagem. Agora mutamos o MESMO objeto.
+        embed.title = f"🟡 {interaction.user.display_name} sacou em {multiplicador_saque:.2f}x!"
+        embed.description = (
+            f"Green de **+{lucro} Pilas** garantido no bolso.\n"
+            f"⏳ *Aguarda -- o foguete vai continuar pra você ver até onde ia...*"
         )
+        embed.color = discord.Color.yellow()
+        embed.clear_fields()
         embed.add_field(name="Aposta", value=f"{self.valor} Pilas", inline=True)
         embed.add_field(name="Sacou em", value=f"{multiplicador_saque:.2f}x", inline=True)
         embed.add_field(name="Lucro", value=f"+{lucro} Pilas", inline=True)
@@ -1391,15 +1368,15 @@ async def crash(interaction: discord.Interaction, valor: int):
     ponto_de_quebra = calcular_ponto_de_quebra()
     view = CrashView(autor_id=interaction.user.id, valor=valor)
 
-    historico = [0]
-    grafico_inicial = gerar_grafico_crash(historico, None, None)
+    historico_mults = [1.00]
     embed = discord.Embed(
         title=f"🚀 Foguete de {interaction.user.display_name}",
-        description=f"{grafico_inicial}\n\n**1.00x** — Clica em 💰 Retirar antes de explodir!",
+        description=gerar_texto_status(gerar_sparkline(historico_mults), 1.00),
         color=discord.Color.blurple(),
     )
     embed.add_field(name="Aposta", value=f"{valor} Pilas", inline=True)
-    embed.add_field(name="Ponto de saque", value="—", inline=True)
+    embed.add_field(name="Status", value="🚀 Voando...", inline=True)
+    view.embed = embed  # FIX: mesma referência usada pelo botão -- nunca mais se perde
     await interaction.response.send_message(embed=embed, view=view)
     view.message = await interaction.original_response()
 
@@ -1413,14 +1390,11 @@ async def crash(interaction: discord.Interaction, valor: int):
 
         if multiplicador_atual >= ponto_de_quebra and not view.retirou:
             # Crashou antes do saque
-            historico.append(tick)
-            grafico = gerar_grafico_crash(historico, None, tick, explodiu_antes_do_saque=True)
+            historico_mults.append(ponto_de_quebra)
             embed.title = f"💥 O Foguete de {interaction.user.display_name} CRASHOU!"
-            embed.description = (
-                f"{grafico}\n\n"
-                f"Explodiu em **{ponto_de_quebra:.2f}x** -- loss de **{valor} Pilas**. "
-                f"A banca agradece, meu consagrado."
-            )
+            embed.description = gerar_texto_status(
+                gerar_sparkline(historico_mults), ponto_de_quebra, valor_crash=ponto_de_quebra,
+                explodiu_antes_do_saque=True)
             embed.color = discord.Color.red()
             embed.set_field_at(0, name="Aposta perdida", value=f"-{valor} Pilas", inline=True)
             embed.set_field_at(1, name="Quebrou em", value=f"{ponto_de_quebra:.2f}x", inline=True)
@@ -1438,11 +1412,9 @@ async def crash(interaction: discord.Interaction, valor: int):
 
         view.multiplicador_atual = multiplicador_atual
         view.tick_atual = tick
-        historico.append(tick)
+        historico_mults.append(multiplicador_atual)
 
-        grafico = gerar_grafico_crash(historico, None, None)
-        embed.description = f"{grafico}\n\n**{multiplicador_atual:.2f}x** — Clica em 💰 Retirar antes de explodir!"
-        embed.set_field_at(1, name="Ponto de saque", value="—", inline=True)
+        embed.description = gerar_texto_status(gerar_sparkline(historico_mults), multiplicador_atual)
         try:
             await interaction.edit_original_response(embed=embed)
         except discord.HTTPException as e:
@@ -1456,31 +1428,27 @@ async def crash(interaction: discord.Interaction, valor: int):
 
     # -----------------------------------------------------------------------
     # Fase 2: usuário sacou -- continua animando (modo "fantasma") até o
-    # ponto de quebra real, revelando onde o foguete teria ido
+    # ponto de quebra real, revelando onde o foguete teria ido. O embed é
+    # o MESMO objeto que o botão já preencheu com Aposta/Sacou em/Lucro --
+    # daqui pra frente só description/title/color mudam, os campos ficam.
     # -----------------------------------------------------------------------
-    tick_saque = view.tick_saque or tick
-    mult_saque = calcular_multiplicador_no_tick(tick_saque)
+    mult_saque = view.multiplicador_atual
+    tick_ghost = tick + 1
 
-    tick_ghost = tick_saque + 1
     while tick_ghost < CRASH_MAX_TICKS:
         mult_ghost = calcular_multiplicador_no_tick(tick_ghost)
-        historico.append(tick_ghost)
-
         crashou_agora = mult_ghost >= ponto_de_quebra
-
-        grafico = gerar_grafico_crash(
-            historico, tick_saque=tick_saque,
-            tick_crash=tick_ghost if crashou_agora else None,
-        )
+        historico_mults.append(ponto_de_quebra if crashou_agora else mult_ghost)
 
         if crashou_agora:
             embed.title = (
-                f"✅ {interaction.user.display_name} sacou em {mult_saque:.2f}x "
-                f"— Foguete crashou em {ponto_de_quebra:.2f}x"
+                f"✅ Sacou em {mult_saque:.2f}x — Foguete crashou em {ponto_de_quebra:.2f}x"
             )
+            texto_final = "🔥 Saiu antes -- boa decisão!" if mult_saque < ponto_de_quebra else "😅 Quase..."
             embed.description = (
-                f"{grafico}\n\n"
-                f"{'🔥 Saiu antes -- boa decisão!' if mult_saque < ponto_de_quebra else '😅 Quase...'}"
+                gerar_texto_status(gerar_sparkline(historico_mults), ponto_de_quebra,
+                                    tick_saque_mult=mult_saque, valor_crash=ponto_de_quebra)
+                + f"\n\n{texto_final}"
             )
             embed.color = discord.Color.green()
             try:
@@ -1489,10 +1457,8 @@ async def crash(interaction: discord.Interaction, valor: int):
                 print(f"[crash] Falha ao editar reveal final: {e}")
             return
 
-        embed.description = (
-            f"{grafico}\n\n"
-            f"🟡 Você sacou em **{mult_saque:.2f}x** | Foguete ainda voando em **{mult_ghost:.2f}x**..."
-        )
+        embed.description = gerar_texto_status(
+            gerar_sparkline(historico_mults), mult_ghost, tick_saque_mult=mult_saque)
         try:
             await interaction.edit_original_response(embed=embed)
         except discord.HTTPException as e:
@@ -1503,9 +1469,11 @@ async def crash(interaction: discord.Interaction, valor: int):
 
     # chegou no limite de ticks sem crashar (teto de 50x) -- reveal
     mult_final = calcular_multiplicador_no_tick(tick_ghost - 1)
-    grafico = gerar_grafico_crash(historico, tick_saque=tick_saque, tick_crash=None)
-    embed.title = f"🚀 {interaction.user.display_name} sacou em {mult_saque:.2f}x — Foguete foi além!"
-    embed.description = f"{grafico}\n\nO foguete passou de **{mult_final:.2f}x** sem explodir. Impressionante."
+    embed.title = f"🚀 Sacou em {mult_saque:.2f}x — Foguete foi além!"
+    embed.description = (
+        gerar_texto_status(gerar_sparkline(historico_mults), mult_final, tick_saque_mult=mult_saque)
+        + "\n\nO foguete passou sem explodir. Impressionante."
+    )
     embed.color = discord.Color.green()
     try:
         await interaction.edit_original_response(embed=embed, view=view)
