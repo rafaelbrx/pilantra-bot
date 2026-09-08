@@ -5,6 +5,7 @@ import os
 import requests
 import random
 import math
+import time
 import asyncio
 import traceback
 from datetime import datetime, timedelta
@@ -26,6 +27,78 @@ jogos_simulados = {}
 
 
 init_db()
+
+
+# ---------------------------------------------------------------------------
+# Backoff persistente contra crash loops
+# ---------------------------------------------------------------------------
+# Se o Render reiniciar o processo repetidamente em sequência rápida (crash
+# loop), cada reinício tentava reconectar ao Discord imediatamente -- e é
+# exatamente esse padrão de reconexões rápidas em sequência que a Cloudflare
+# identifica como abuso e usa pra ESTENDER o bloqueio (erro 1015), em vez de
+# deixá-lo expirar. Como o processo é reiniciado do zero a cada crash, um
+# backoff guardado só em memória não sobreviveria -- por isso persistimos no
+# Postgres, que continua de pé entre reinícios.
+
+def aplicar_backoff_de_conexao():
+    """Roda ANTES de bot.run(). Se detectar que a última tentativa de conexão
+    foi há pouco tempo, espera (bloqueando, de propósito -- isso é antes do
+    event loop do bot existir) por um período crescente."""
+    BACKOFFS_SEGUNDOS = [5, 30, 120, 300, 600]  # 5s, 30s, 2min, 5min, 10min (teto)
+
+    try:
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS bot_startup_control (
+                        chave TEXT PRIMARY KEY,
+                        ultimo_timestamp TEXT,
+                        tentativas INTEGER
+                     )''')
+        c.execute("SELECT ultimo_timestamp, tentativas FROM bot_startup_control WHERE chave = 'startup'")
+        res = c.fetchone()
+        agora = datetime.utcnow()
+
+        if res:
+            ultimo_timestamp_str, tentativas = res
+            ultimo = datetime.fromisoformat(ultimo_timestamp_str)
+            segundos_desde_ultimo = (agora - ultimo).total_seconds()
+            indice_backoff = min(tentativas, len(BACKOFFS_SEGUNDOS) - 1)
+            backoff_necessario = BACKOFFS_SEGUNDOS[indice_backoff]
+
+            if segundos_desde_ultimo < backoff_necessario:
+                espera = backoff_necessario - segundos_desde_ultimo
+                print(f"[startup] Reinício rápido detectado (última tentativa há {segundos_desde_ultimo:.0f}s, "
+                      f"tentativa nº{tentativas + 1}). Aguardando {espera:.0f}s antes de conectar ao Discord "
+                      f"-- isso evita alimentar um possível bloqueio da Cloudflare (erro 1015).")
+                time.sleep(espera)
+            novas_tentativas = min(tentativas + 1, len(BACKOFFS_SEGUNDOS) - 1)
+        else:
+            novas_tentativas = 0
+
+        c.execute('''INSERT INTO bot_startup_control (chave, ultimo_timestamp, tentativas)
+                     VALUES ('startup', %s, %s)
+                     ON CONFLICT (chave) DO UPDATE SET
+                         ultimo_timestamp = EXCLUDED.ultimo_timestamp,
+                         tentativas = EXCLUDED.tentativas''',
+                  (agora.isoformat(), novas_tentativas))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[startup] Não consegui aplicar o backoff de conexão (seguindo sem essa proteção): {e}")
+
+
+def resetar_contador_de_tentativas():
+    """Chamado assim que on_ready() dispara com sucesso -- zera o contador,
+    já que a conexão funcionou e não faz sentido continuar escalando o
+    backoff pra reinícios normais e saudáveis no futuro."""
+    try:
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute('''UPDATE bot_startup_control SET tentativas = 0 WHERE chave = 'startup' ''')
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[startup] Não consegui resetar o contador de backoff: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1713,6 +1786,10 @@ _slash_commands_ja_sincronizados = False
 async def on_ready():
     print(f'🔥 Pilantra online como {bot.user}')
 
+    # Conexão bem-sucedida -- zera o contador de backoff pra não continuar
+    # escalando desnecessariamente em reinícios futuros e saudáveis.
+    resetar_contador_de_tentativas()
+
     global _slash_commands_ja_sincronizados
     if _slash_commands_ja_sincronizados:
         print("[sync] Reconexão detectada -- pulando novo bot.tree.sync() (já sincronizado nesta execução).")
@@ -1754,6 +1831,7 @@ async def on_ready():
 keep_alive()
 token = os.environ.get('DISCORD_TOKEN')
 if token:
+    aplicar_backoff_de_conexao()
     bot.run(token)
 else:
     print("Erro: Token do Discord não encontrado nas variáveis de ambiente!")
