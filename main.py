@@ -996,7 +996,7 @@ async def salario(interaction: discord.Interaction):
         conn.commit()
     finally:
         conn.close()
-    await interaction.response.send_message(f"🎁 {interaction.user.mention} resgatou a diária! Novo saldo: {novo} Pilas.")
+    await interaction.response.send_message(f"🎁 {interaction.user.mention} resgatou o faz me rir! Novo saldo: {novo} Pilas.")
 
 
 @bot.tree.command(name="mendigar", description="Pede 100 Pilas de graça (a cada 24h, só se estiver quebrado)")
@@ -1439,6 +1439,7 @@ async def crash(interaction: discord.Interaction, valor: int):
         conn.close()  # FECHADO antes de qualquer asyncio.sleep
 
     ponto_de_quebra = calcular_ponto_de_quebra()
+    print(f"[crash] Foguete do usuário {interaction.user} vai crashar em: {ponto_de_quebra:.2f}x")
     view = CrashView(autor_id=interaction.user.id, valor=valor)
 
     historico_mults = [1.00]
