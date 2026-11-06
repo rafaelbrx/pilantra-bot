@@ -4,21 +4,36 @@ import shlex
 from dataclasses import dataclass
 
 import discord
+import discord.opus
 from discord.ext import commands
 import yt_dlp
 from dotenv import load_dotenv
-print(f"[dj] opus carregado:0 {discord.opus.is_loaded()}")
 
 from keep_alive import keep_alive
 
 load_dotenv()
+
+# ffmpeg: usa o binário do imageio-ffmpeg se estiver instalado,
+# senão usa o ffmpeg do sistema (caso do Render com Docker)
+try:
+    import imageio_ffmpeg
+    FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+except ImportError:
+    FFMPEG_EXE = "ffmpeg"
+
+# Opus: no Windows precisa ser carregado manualmente.
+# No Render (Docker com libopus0) o sistema já encontra sozinho.
+OPUS_DLL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "opus.dll")
+if not discord.opus.is_loaded() and os.path.exists(OPUS_DLL):
+    discord.opus.load_opus(OPUS_DLL)
+print(f"[dj] opus carregado: {discord.opus.is_loaded()}")
 
 intents = discord.Intents.default()
 intents.message_content = True  # necessário para ler comandos com prefixo
 bot = commands.Bot(command_prefix=".", intents=intents, help_command=None)
 
 YDL_OPTS = {
-    "format": "http_mp3/bestaudio/best",
+    "format": "bestaudio/best",
     "noplaylist": True,
     "quiet": True,
     "default_search": "scsearch",
@@ -50,7 +65,6 @@ def buscar_musica(query: str) -> tuple[str, str, dict]:
         if "entries" in info:
             info = info["entries"][0]
         headers = info.get("http_headers") or {}
-        print(f"[dj] headers recebidos: {list(headers.keys())}")  # diagnóstico
         return info["title"], info["url"], headers
 
 
@@ -79,6 +93,7 @@ async def tocar_proxima(guild: discord.Guild):
     musica = fila.pop(0)
     fonte = discord.FFmpegPCMAudio(
         musica.url_stream,
+        executable=FFMPEG_EXE,
         **montar_ffmpeg_opts(musica.headers),
     )
 
@@ -88,12 +103,20 @@ async def tocar_proxima(guild: discord.Guild):
         asyncio.run_coroutine_threadsafe(tocar_proxima(guild), bot.loop)
 
     vc.play(fonte, after=depois)
-    print(f"[dj] tocando '{musica.titulo}' | is_playing: {vc.is_playing()}")
 
 
 @bot.event
 async def on_ready():
     print(f"🎧 DJ Pilantra online como {bot.user}")
+
+
+async def conectar_no_canal(ctx: commands.Context, canal: discord.VoiceChannel):
+    guild = ctx.guild
+    if guild.voice_client is None:
+        await canal.connect()
+    elif guild.voice_client.channel != canal:
+        await guild.voice_client.move_to(canal)
+    return guild.voice_client
 
 
 @bot.command(name="tocar", aliases=["t", "play"])
@@ -110,27 +133,37 @@ async def tocar(ctx: commands.Context, *, busca: str):
             print(f"[tocar] Falha ao buscar '{busca}': {e}")
             return await ctx.send("❌ Não consegui encontrar essa música.")
 
-    guild = ctx.guild
-    if guild.voice_client is None:
-        await voz.channel.connect()
-    elif guild.voice_client.channel != voz.channel:
-        await guild.voice_client.move_to(voz.channel)
+    vc = await conectar_no_canal(ctx, voz.channel)
 
-    fila_do(guild.id).append(
+    fila_do(ctx.guild.id).append(
         Musica(titulo, url_stream, ctx.author.display_name, headers)
     )
 
-    vc = guild.voice_client
     if vc.is_playing() or vc.is_paused():
         await ctx.send(f"➕ **{titulo}** entrou na fila.")
     else:
         await ctx.send(f"▶️ Tocando agora: **{titulo}**")
-        await tocar_proxima(guild)
-        await asyncio.sleep(3)
-        await ctx.send(
-            f"debug: opus={discord.opus.is_loaded()} | is_playing={vc.is_playing()}"
-            f"headers={len(headers)} | versão=v3"
-        )
+        await tocar_proxima(ctx.guild)
+
+
+@bot.command(name="teste")
+async def teste(ctx: commands.Context):
+    """Toca um tom de teste de 5 segundos."""
+    voz = ctx.author.voice
+    if not voz or not voz.channel:
+        return await ctx.send("🎧 Entra numa call primeiro.")
+
+    vc = await conectar_no_canal(ctx, voz.channel)
+    if vc.is_playing():
+        vc.stop()
+
+    fonte = discord.FFmpegPCMAudio(
+        "sine=frequency=440:duration=5",
+        before_options="-f lavfi",
+        executable=FFMPEG_EXE,
+    )
+    vc.play(fonte)
+    await ctx.send("🔊 Tom de teste de 5 segundos.")
 
 
 @bot.command(name="pular", aliases=["skip", "s"])
@@ -171,31 +204,11 @@ async def ajuda(ctx: commands.Context):
         "`.tocar <link ou nome>` (ou `.t`) — adiciona na fila\n"
         "`.pular` (ou `.s`) — pula a música\n"
         "`.fila` (ou `.q`) — mostra a fila\n"
-        "`.parar` — para tudo e sai do canal"
+        "`.parar` — para tudo e sai do canal\n"
+        "`.teste` — toca um tom de 5 segundos"
     )
     await ctx.send(texto)
 
-@bot.command(name="teste")
-async def teste(ctx: commands.Context):
-    """Comando de teste para verificar se o bot está funcionando."""
-    voz = ctx.author.voice
-    if not voz or not voz.channel:
-        return await ctx.send("🎧 Entra num canal de voz primeiro, camarada.")
-
-    guild = ctx.guild
-    if guild.voice_client is None:
-        await voz.channel.connect()
-    vc = guild.voice_client
-    if vc.is_playing():
-        vc.stop()
-
-    fonte =  discord.FFmpegPCMAudio(
-        "sine=frequency=440:duration=5",
-        before_options="-f lavfi",
-        executable=FFMPEG_EXE,
-    )
-    vc.play(fonte)
-    await ctx.send("🔊 Teste de áudio iniciado por 5 segundos.")
 
 token = os.environ.get("DISCORD_TOKEN_DJ")
 if token:
