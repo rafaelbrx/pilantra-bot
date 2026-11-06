@@ -8,13 +8,10 @@ from discord.ext import commands
 import yt_dlp
 from dotenv import load_dotenv
 print(f"[dj] opus carregado:0 {discord.opus.is_loaded()}")
-import imageio_ffmpeg
 
 from keep_alive import keep_alive
 
 load_dotenv()
-
-FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
 intents = discord.Intents.default()
 intents.message_content = True  # necessário para ler comandos com prefixo
@@ -82,7 +79,6 @@ async def tocar_proxima(guild: discord.Guild):
     musica = fila.pop(0)
     fonte = discord.FFmpegPCMAudio(
         musica.url_stream,
-        executable=FFMPEG_EXE,
         **montar_ffmpeg_opts(musica.headers),
     )
 
