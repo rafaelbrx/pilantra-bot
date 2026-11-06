@@ -179,6 +179,27 @@ async def ajuda(ctx: commands.Context):
     )
     await ctx.send(texto)
 
+@bot.command(name="teste")
+async def teste(ctx: commands.Context):
+    """Comando de teste para verificar se o bot está funcionando."""
+    voz = ctx.author.voice
+    if not voz or not voz.channel:
+        return await ctx.send("🎧 Entra num canal de voz primeiro, camarada.")
+
+    guild = ctx.guild
+    if guild.voice_client is None:
+        await voz.channel.connect()
+    vc = guild.voice_client
+    if vc.is_playing():
+        vc.stop()
+
+    fonte =  discord.FFmpegPCMAudio(
+        "sine=frequency=440:duration=5",
+        before_options="-f lavfi",
+        executable=FFMPEG_EXE,
+    )
+    vc.play(fonte)
+    await ctx.send("🔊 Teste de áudio iniciado por 5 segundos.")
 
 token = os.environ.get("DISCORD_TOKEN_DJ")
 if token:
