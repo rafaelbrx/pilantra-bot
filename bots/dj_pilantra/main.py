@@ -20,6 +20,10 @@ YDL_OPTS = {
     "noplaylist": True,
     "quiet": True,
     "default_search": "ytsearch",
+    "extractor_args": {
+        "youtube": {"player_client": ["android", "web_safari"]},
+    },
+    "source_address": "0.0.0.0",  # força IPv4, às vezes ajuda
 }
 FFMPEG_OPTS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
