@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: dj-pilantra
+    runtime: docker
+    rootDir: bots/dj_pilantra
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: DISCORD_TOKEN_DJ
+        sync: false
