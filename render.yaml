@@ -3,8 +3,8 @@ services:
     name: dj-pilantra
     runtime: docker
     rootDir: bots/dj_pilantra
-    dockerfilePath: ./bots/dj_pilantra/Dockerfile
-    dockerContext: ./bots/dj_pilantra
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
     envVars:
       - key: DISCORD_TOKEN_DJ
         sync: false
