@@ -130,6 +130,11 @@ async def tocar(ctx: commands.Context, *, busca: str):
     else:
         await ctx.send(f"▶️ Tocando agora: **{titulo}**")
         await tocar_proxima(guild)
+        await asyncio.sleep(3)
+        await ctx.send(
+            f"debug: opus={discord.opus.is_loaded()} | is_playing={vc.is_playing()}"
+            f"headers={len(headers)} | versão=v3"
+        )
 
 
 @bot.command(name="pular", aliases=["skip", "s"])
