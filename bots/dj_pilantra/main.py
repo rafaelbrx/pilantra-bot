@@ -209,6 +209,27 @@ async def ajuda(ctx: commands.Context):
     )
     await ctx.send(texto)
 
+@bot.command(name="arquivo")
+async def arquivo(ctx: commands.Context):
+    voz = ctx.author.voice
+    if not voz or not voz.channel:
+        return await ctx.send("🎧 Entra num canal de voz primeiro, camarada.")
+
+    caminho_arquivo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "faaah.mp3")
+    if not os.path.exists(caminho_arquivo):
+        return await ctx.send("❌ Arquivo de áudio não encontrado.")
+
+    vc = await conectar_no_canal(ctx, voz.channel)
+    if vc.is_playing() or vc.is_paused():   
+        vc.stop()  # para a música atual antes de tocar o arquivo
+
+    fonte = discord.FFmpegPCMAudio(
+        caminho_arquivo,
+        executable=FFMPEG_EXE,
+    )
+    vc.play(fonte)
+    await ctx.send("▶️ Tocando o arquivo de áudio")
+    
 
 token = os.environ.get("DISCORD_TOKEN_DJ")
 if token:
