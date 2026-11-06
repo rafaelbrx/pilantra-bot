@@ -150,9 +150,9 @@ async def ajuda(ctx: commands.Context):
     await ctx.send(texto)
 
 
-token = os.environ.get("DISCORD_TOKEN")
+token = os.environ.get("DISCORD_TOKEN_DJ")
 if token:
     keep_alive()
     bot.run(token)
 else:
-    print("Erro: DISCORD_TOKEN não encontrada nas variáveis de ambiente!")
+    print("Erro: DISCORD_TOKEN_DJ não encontrada nas variáveis de ambiente!")
