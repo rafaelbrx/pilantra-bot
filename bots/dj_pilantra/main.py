@@ -19,11 +19,7 @@ YDL_OPTS = {
     "format": "bestaudio/best",
     "noplaylist": True,
     "quiet": True,
-    "default_search": "ytsearch",
-    "cookiefile": "/etc/secrets/cookies.txt",
-    "extractor_args": {
-        "youtube": {"player_client": ["web", "web_safari"]},
-    },
+    "default_search": "scsearch"
 }
 FFMPEG_OPTS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
@@ -46,7 +42,8 @@ def fila_do(guild_id: int) -> list[Musica]:
 
 
 def buscar_musica(query: str) -> tuple[str, str]:
-    with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
+    opts = {**YDL_OPTS, "default_search": "scsearch"}
+    with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(query, download=False)
         if "entries" in info:
             info = info["entries"][0]
