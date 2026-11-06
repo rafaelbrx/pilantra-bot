@@ -21,7 +21,7 @@ intents.message_content = True  # necessário para ler comandos com prefixo
 bot = commands.Bot(command_prefix=".", intents=intents, help_command=None)
 
 YDL_OPTS = {
-    "format": "bestaudio/best",
+    "format": "http_mp3/bestaudio/best",
     "noplaylist": True,
     "quiet": True,
     "default_search": "scsearch",
