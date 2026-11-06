@@ -7,6 +7,7 @@ import discord
 from discord.ext import commands
 import yt_dlp
 from dotenv import load_dotenv
+print(f"[dj] opus carregado:0 {discord.opus.is_loaded()}")
 import imageio_ffmpeg
 
 from keep_alive import keep_alive
@@ -91,6 +92,7 @@ async def tocar_proxima(guild: discord.Guild):
         asyncio.run_coroutine_threadsafe(tocar_proxima(guild), bot.loop)
 
     vc.play(fonte, after=depois)
+    print(f"[dj] tocando '{musica.titulo}' | is_playing: {vc.is_playing()}")
 
 
 @bot.event
