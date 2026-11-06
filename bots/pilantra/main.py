@@ -6,8 +6,8 @@ import requests
 import random
 import asyncio
 from datetime import datetime, timedelta
-from keep_alive import keep_alive
-from db import get_conn, init_db
+from bots.pilantra.keep_alive import keep_alive
+from bots.pilantra.db import get_conn, init_db
 from dotenv import load_dotenv
 
 load_dotenv()
