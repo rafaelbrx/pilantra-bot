@@ -9,8 +9,8 @@ import time
 import asyncio
 import traceback
 from datetime import datetime, timedelta
-from bots.pilantra.keep_alive import keep_alive
-from bots.pilantra.db import get_conn, init_db
+from keep_alive import keep_alive
+from db import get_conn, init_db
 from dotenv import load_dotenv
 
 load_dotenv()
