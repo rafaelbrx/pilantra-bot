@@ -1,15 +1,19 @@
 import asyncio
 import os
+import shlex
 from dataclasses import dataclass
 
 import discord
 from discord.ext import commands
 import yt_dlp
 from dotenv import load_dotenv
+import imageio_ffmpeg
 
 from keep_alive import keep_alive
 
 load_dotenv()
+
+FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
 intents = discord.Intents.default()
 intents.message_content = True  # necessário para ler comandos com prefixo
@@ -19,7 +23,7 @@ YDL_OPTS = {
     "format": "bestaudio/best",
     "noplaylist": True,
     "quiet": True,
-    "default_search": "scsearch"
+    "default_search": "scsearch",
 }
 FFMPEG_OPTS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
@@ -32,6 +36,7 @@ class Musica:
     titulo: str
     url_stream: str
     pedido_por: str
+    headers: dict
 
 
 filas: dict[int, list[Musica]] = {}
@@ -41,13 +46,24 @@ def fila_do(guild_id: int) -> list[Musica]:
     return filas.setdefault(guild_id, [])
 
 
-def buscar_musica(query: str) -> tuple[str, str]:
-    opts = {**YDL_OPTS, "default_search": "scsearch"}
-    with yt_dlp.YoutubeDL(opts) as ydl:
+def buscar_musica(query: str) -> tuple[str, str, dict]:
+    with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
         info = ydl.extract_info(query, download=False)
         if "entries" in info:
             info = info["entries"][0]
-        return info["title"], info["url"]
+        headers = info.get("http_headers") or {}
+        print(f"[dj] headers recebidos: {list(headers.keys())}")  # diagnóstico
+        return info["title"], info["url"], headers
+
+
+def montar_ffmpeg_opts(headers: dict) -> dict:
+    opts = dict(FFMPEG_OPTS)
+    if headers:
+        texto = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+        opts["before_options"] = (
+            opts["before_options"] + f" -headers {shlex.quote(texto)}"
+        )
+    return opts
 
 
 async def tocar_proxima(guild: discord.Guild):
@@ -63,7 +79,11 @@ async def tocar_proxima(guild: discord.Guild):
         return
 
     musica = fila.pop(0)
-    fonte = discord.FFmpegPCMAudio(musica.url_stream, **FFMPEG_OPTS)
+    fonte = discord.FFmpegPCMAudio(
+        musica.url_stream,
+        executable=FFMPEG_EXE,
+        **montar_ffmpeg_opts(musica.headers),
+    )
 
     def depois(erro):
         if erro:
@@ -87,7 +107,7 @@ async def tocar(ctx: commands.Context, *, busca: str):
 
     async with ctx.typing():
         try:
-            titulo, url_stream = await asyncio.to_thread(buscar_musica, busca)
+            titulo, url_stream, headers = await asyncio.to_thread(buscar_musica, busca)
         except Exception as e:
             print(f"[tocar] Falha ao buscar '{busca}': {e}")
             return await ctx.send("❌ Não consegui encontrar essa música.")
@@ -98,7 +118,9 @@ async def tocar(ctx: commands.Context, *, busca: str):
     elif guild.voice_client.channel != voz.channel:
         await guild.voice_client.move_to(voz.channel)
 
-    fila_do(guild.id).append(Musica(titulo, url_stream, ctx.author.display_name))
+    fila_do(guild.id).append(
+        Musica(titulo, url_stream, ctx.author.display_name, headers)
+    )
 
     vc = guild.voice_client
     if vc.is_playing() or vc.is_paused():
@@ -119,7 +141,7 @@ async def pular(ctx: commands.Context):
 
 
 @bot.command(name="fila", aliases=["q"])
-async def fila(ctx: commands.Context):
+async def ver_fila(ctx: commands.Context):
     """Mostra a fila de músicas."""
     itens = fila_do(ctx.guild.id)
     if not itens:
